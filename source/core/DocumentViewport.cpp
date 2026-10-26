@@ -1146,6 +1146,11 @@ bool DocumentViewport::hasActiveObjectPointerGesture() const
             || m_isCreatingTextBox || m_isDraggingObjects || m_isResizingObject);
 }
 
+bool DocumentViewport::hasObjectGestureInFlight() const
+{
+    return m_isDraggingObjects || m_isResizingObject || m_isCreatingTextBox;
+}
+
 void DocumentViewport::beginObjectPointerGesture(const PointerEvent& pe)
 {
     m_objectGestureButton =

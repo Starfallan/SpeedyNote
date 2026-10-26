@@ -1889,7 +1889,12 @@ void MainWindow::wireQActionDispatchers()
             if (auto* vp = w->currentViewport()) {
                 if (w->m_toolOverrideViewport == vp)
                     w->m_toolOverrideViewport = nullptr;
-                vp->setCurrentTool(tool);
+                // Choosing a tool by hand settles a Hold revert that was
+                // waiting for the next contact; the pick wins.
+                w->flushPendingStylusRevert();
+                if (vp->currentTool() != tool) {
+                    vp->setCurrentTool(tool);
+                }
             }
         });
     };
@@ -5133,6 +5138,14 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
     // viewport, so this runs before DocumentViewport::tabletEvent and the tool
     // it selects is the one that draws the very same event. Never consume the
     // event: the viewport still needs it.
+    //
+    // A Hold revert postponed because the previous contact left a selection
+    // behind is settled here, before the viewport sees this contact, so the
+    // stroke that starts now is drawn with the restored tool.
+    if ((event->type() == QEvent::TabletPress || event->type() == QEvent::MouseButtonPress)
+        && (m_stylusButtonAPendingRevert || m_stylusButtonBPendingRevert)) {
+        flushPendingStylusRevert();
+    }
     if (event->type() == QEvent::TabletPress
         || event->type() == QEvent::TabletRelease
         || event->type() == QEvent::TabletMove) {
@@ -5833,7 +5846,11 @@ void MainWindow::setStylusButtonMappingEnabled(bool enabled) {
 
     // Turning the feature off while a mapping is applied must not strand the
     // viewport on the temporary tool.
+    // Turning the feature off while a mapping is applied must not strand the
+    // viewport on the temporary tool.
     if (!enabled) {
+        m_stylusButtonAPendingRevert = false;
+        m_stylusButtonBPendingRevert = false;
         if (m_stylusButtonAActive) revertStylusButtonMapping(m_stylusButtonAQt);
         if (m_stylusButtonBActive) revertStylusButtonMapping(m_stylusButtonBQt);
     }
@@ -5934,6 +5951,41 @@ void MainWindow::revertStylusButtonMapping(Qt::MouseButton button) {
     }
 }
 
+// A gesture that ends while a mapped tool is active only keeps its result if
+// that tool can still show and act on it. Lasso strokes, selected objects and
+// selected text all live in state the tool switch clears (see
+// DocumentViewport::setCurrentTool), so reverting right after such a gesture
+// would discard what the user just made. Pen, Marker and Eraser commit their
+// result before the release is over, so they revert immediately as before.
+bool MainWindow::stylusMappedToolHoldsWork() {
+    DocumentViewport* vp = m_stylusButtonMappedViewport;
+    if (!vp) return false;
+
+    // A revert can arrive before the viewport has seen the release that turns
+    // a lasso path into a selection, in which case there is nothing to check
+    // yet. Waiting is the only safe answer: reverting now loses the gesture.
+    if (vp->isSelectionGestureActive()) return true;
+
+    if (vp->hasLassoSelection() || vp->hasSelectedObjects()
+        || vp->hasTextSelection()) {
+        return true;
+    }
+
+    // An object drag/resize/create that is still running has not written its
+    // result yet; switching tools now would cancel it (cancelObjectPointerGesture).
+    return vp->hasObjectGestureInFlight();
+}
+
+void MainWindow::flushPendingStylusRevert() {
+    const bool pendingA = m_stylusButtonAPendingRevert;
+    const bool pendingB = m_stylusButtonBPendingRevert;
+    m_stylusButtonAPendingRevert = false;
+    m_stylusButtonBPendingRevert = false;
+
+    if (pendingA) revertStylusButtonMapping(m_stylusButtonAQt);
+    if (pendingB) revertStylusButtonMapping(m_stylusButtonBQt);
+}
+
 void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
                                            Qt::MouseButton changedButton,
                                            bool isPress,
@@ -5963,6 +6015,14 @@ void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
     auto processButton = [this, viewport](bool isA, bool pressEdge, bool releaseEdge) {
         const StylusButtonMode mode = isA ? m_stylusButtonAMode : m_stylusButtonBMode;
         const Qt::MouseButton qtButton = isA ? m_stylusButtonAQt : m_stylusButtonBQt;
+        // A Hold release may have been postponed until now. Settle it first so
+        // this press maps from the real previous tool instead of pinning the
+        // temporary one as its own restore target.
+        if (pressEdge
+            && (isA ? m_stylusButtonAPendingRevert : m_stylusButtonBPendingRevert)) {
+            flushPendingStylusRevert();
+        }
+
         const bool active = isA ? m_stylusButtonAActive : m_stylusButtonBActive;
 
         switch (mode) {
@@ -5970,7 +6030,15 @@ void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
                 if (pressEdge && !active) {
                     applyStylusButtonMapping(qtButton, viewport);
                 } else if (releaseEdge && active) {
-                    revertStylusButtonMapping(qtButton);
+                    if (stylusMappedToolHoldsWork()) {
+                        if (isA) {
+                            m_stylusButtonAPendingRevert = true;
+                        } else {
+                            m_stylusButtonBPendingRevert = true;
+                        }
+                    } else {
+                        revertStylusButtonMapping(qtButton);
+                    }
                 }
                 break;
 

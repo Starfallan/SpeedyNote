@@ -1137,6 +1137,28 @@ public:
      * @brief Check if the hardware eraser (stylus eraser end) is active.
      */
     bool isHardwareEraserActive() const { return m_hardwareEraserActive; }
+
+    /**
+     * @brief Check if a selection gesture is still in flight.
+     * @return True while a lasso path is being drawn or a selection transform
+     *         is in progress.
+     *
+     * A caller that is about to switch tools uses this to avoid judging the
+     * gesture by its result before the tool has been given the release event
+     * that turns the path into a selection.
+     */
+    bool isSelectionGestureActive() const {
+        return m_isDrawingLasso || m_isTransformingSelection;
+    }
+
+    /**
+     * @brief Check if an object gesture is still in flight.
+     * @return True while an object is being dragged, resized or created.
+     *
+     * Exposed next to isSelectionGestureActive() so a caller that is about to
+     * switch tools can tell a finished gesture from one that is still going.
+     */
+    bool hasObjectGestureInFlight() const;
     
     // ===== Layout Engine (Task 1.3.2) =====
     

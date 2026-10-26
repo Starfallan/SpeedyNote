@@ -1209,7 +1209,13 @@ void MainWindow::setupUi() {
         if (DocumentViewport* vp = currentViewport()) {
             if (m_toolOverrideViewport == vp)
                 m_toolOverrideViewport = nullptr;
-            vp->setCurrentTool(tool);
+            // A tool picked by hand wins over a Hold revert that is still
+            // waiting for its selection to be dismissed; settle it first so it
+            // cannot override this choice when the selection clears.
+            flushPendingStylusRevert();
+            if (vp->currentTool() != tool) {
+                vp->setCurrentTool(tool);
+            }
         }
     });
     connect(m_toolbar, &Toolbar::objectInsertModeSelected, this,
@@ -2436,6 +2442,18 @@ void MainWindow::connectViewportScrollSignals(DocumentViewport* viewport) {
         disconnect(m_textSelectionConn);
         m_textSelectionConn = {};
     }
+    if (m_stylusSelectionEndConn) {
+        disconnect(m_stylusSelectionEndConn);
+        m_stylusSelectionEndConn = {};
+    }
+    if (m_stylusObjectSelectionEndConn) {
+        disconnect(m_stylusObjectSelectionEndConn);
+        m_stylusObjectSelectionEndConn = {};
+    }
+    if (m_stylusTextSelectionEndConn) {
+        disconnect(m_stylusTextSelectionEndConn);
+        m_stylusTextSelectionEndConn = {};
+    }
     if (m_strokeClipboardConn) {
         disconnect(m_strokeClipboardConn);
         m_strokeClipboardConn = {};
@@ -2669,6 +2687,29 @@ void MainWindow::connectViewportScrollSignals(DocumentViewport* viewport) {
     // Lasso selection changed (shows/hides LassoActionBar)
     m_lassoSelectionConn = connect(viewport, &DocumentViewport::lassoSelectionChanged,
                                    m_actionBarContainer, &ActionBarContainer::onLassoSelectionChanged);
+
+    // A Hold-mapped Lasso/ObjectSelect/Highlighter is kept until its work is
+    // done: the selection it produced has to stay usable, including the action
+    // bar the user then clicks. Reverting on the next press would clear the
+    // selection and hide that bar out from under the click.
+    m_stylusSelectionEndConn = connect(
+        viewport, &DocumentViewport::lassoSelectionChanged, this,
+        [this](bool hasSelection) {
+            if (!hasSelection) onStylusSelectionEnded();
+        });
+    m_stylusObjectSelectionEndConn = connect(
+        viewport, &DocumentViewport::objectSelectionChanged, this,
+        [this, viewport]() {
+            if (!viewport->hasSelectedObjects()
+                && !viewport->hasObjectGestureInFlight()) {
+                onStylusSelectionEnded();
+            }
+        });
+    m_stylusTextSelectionEndConn = connect(
+        viewport, &DocumentViewport::textSelectionChanged, this,
+        [this](bool hasSelection) {
+            if (!hasSelection) onStylusSelectionEnded();
+        });
 
     // Sync the recolor swatch on the LassoActionBar to the current pen color
     // every time a fresh selection appears, so the "default" target color
@@ -5140,12 +5181,9 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
     // event: the viewport still needs it.
     //
     // A Hold revert postponed because the previous contact left a selection
-    // behind is settled here, before the viewport sees this contact, so the
-    // stroke that starts now is drawn with the restored tool.
-    if ((event->type() == QEvent::TabletPress || event->type() == QEvent::MouseButtonPress)
-        && (m_stylusButtonAPendingRevert || m_stylusButtonBPendingRevert)) {
-        flushPendingStylusRevert();
-    }
+    // behind is not settled here on the next press: that press may be the user
+    // clicking the action bar the selection just opened. It is settled by
+    // onStylusSelectionEnded() instead, once the selection is really gone.
     if (event->type() == QEvent::TabletPress
         || event->type() == QEvent::TabletRelease
         || event->type() == QEvent::TabletMove) {
@@ -5846,8 +5884,6 @@ void MainWindow::setStylusButtonMappingEnabled(bool enabled) {
 
     // Turning the feature off while a mapping is applied must not strand the
     // viewport on the temporary tool.
-    // Turning the feature off while a mapping is applied must not strand the
-    // viewport on the temporary tool.
     if (!enabled) {
         m_stylusButtonAPendingRevert = false;
         m_stylusButtonBPendingRevert = false;
@@ -5986,13 +6022,38 @@ void MainWindow::flushPendingStylusRevert() {
     if (pendingB) revertStylusButtonMapping(m_stylusButtonBQt);
 }
 
+// The mapped tool's work is done once the selection it produced is gone: the
+// user deleted the strokes/objects, cleared the selection, or emptied it. Only
+// then does the Hold revert run, so the action bar the selection opened stays
+// clickable for as long as there is something to act on.
+void MainWindow::onStylusSelectionEnded() {
+    if (!m_stylusButtonAPendingRevert && !m_stylusButtonBPendingRevert) return;
+
+    DocumentViewport* vp = m_stylusButtonMappedViewport;
+    if (!vp) {
+        flushPendingStylusRevert();
+        return;
+    }
+
+    // A gesture that is still running has not produced its result yet, and a
+    // selection may have just been replaced by another one.
+    if (vp->isSelectionGestureActive() || vp->hasObjectGestureInFlight()) return;
+    if (vp->hasLassoSelection() || vp->hasSelectedObjects() || vp->hasTextSelection()) {
+        return;
+    }
+
+    flushPendingStylusRevert();
+}
+
 void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
                                            Qt::MouseButton changedButton,
                                            bool isPress,
                                            DocumentViewport* viewport) {
     Q_UNUSED(changedButton);
-    Q_UNUSED(isPress);
-    if (!m_stylusButtonMappingEnabled) return;
+    // A Hold revert is postponed while the selection it produced still has
+    // something to act on (the user may be about to click the action bar), so
+    // edges must keep being tracked after the feature is switched off;
+    // setStylusButtonMappingEnabled() settles any such revert.
 
     // Derive the currently-down state of each mapped button from the full
     // button mask, then compare with the previous event's state to find edges.
@@ -6011,6 +6072,10 @@ void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
     m_stylusButtonBHeld = bDown;
 
     if (!aPressEdge && !aReleaseEdge && !bPressEdge && !bReleaseEdge) return;
+
+    // Nothing to switch when the feature is off, but edges above still have to
+    // run so the held-state bookkeeping stays correct for a later re-enable.
+    if (!m_stylusButtonMappingEnabled) return;
 
     auto processButton = [this, viewport](bool isA, bool pressEdge, bool releaseEdge) {
         const StylusButtonMode mode = isA ? m_stylusButtonAMode : m_stylusButtonBMode;

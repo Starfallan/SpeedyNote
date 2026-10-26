@@ -1014,11 +1014,14 @@ private:
     void revertStylusButtonMapping(Qt::MouseButton button);
     /// True when the gesture that just ended left something the mapped tool
     /// keeps (lasso/object/text selection). Reverting the tool would clear it,
-    /// so the revert waits for the next contact instead.
+    /// so the revert waits until that selection is dismissed.
     bool stylusMappedToolHoldsWork();
     /// Run a revert that was postponed by stylusMappedToolHoldsWork(), now that
-    /// the next contact is arriving.
+    /// the reason for postponing it is gone.
     void flushPendingStylusRevert();
+    /// Settles a postponed Hold revert once the selection the mapped tool made
+    /// is really gone (deleted, cleared, or replaced by nothing).
+    void onStylusSelectionEnded();
 
     // Viewport a Hold/Toggle mapping was applied to, so the revert reaches the
     // same pane even in split view. QPointer so a closed tab cannot dangle.
@@ -1029,6 +1032,12 @@ private:
     // pending revert is applied first, then the new mapping.
     bool m_stylusButtonAPendingRevert = false;
     bool m_stylusButtonBPendingRevert = false;
+
+    // Selection-ended hooks for the mapped viewport. Tracked so a viewport
+    // switch drops them instead of letting a stale pane revert the new one.
+    QMetaObject::Connection m_stylusSelectionEndConn;
+    QMetaObject::Connection m_stylusObjectSelectionEndConn;
+    QMetaObject::Connection m_stylusTextSelectionEndConn;
 };
 
 #endif // MAINWINDOW_H

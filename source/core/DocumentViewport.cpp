@@ -4664,6 +4664,23 @@ void DocumentViewport::tabletEvent(QTabletEvent* event)
 
     // Determine event type
     PointerEvent::Type peType;
+    // The Windows WM_POINTER backend cannot report the pen tip and a side
+    // button separately: while a barrel button is held it replaces LeftButton
+    // with RightButton ("Either left or right, not both",
+    // qwindowspointerhandler.cpp). Two places below take "LeftButton in the
+    // mask" as proof that the tip is down, which never holds on that backend.
+    // It also keeps the side button out of the mask while the pen hovers, so a
+    // side button present in the mask already means real contact there.
+    // Wintab-style backends report both bits and can deliver a side button
+    // while hovering, so the tip-button test stays valid for them.
+#ifdef SN_HAS_POINTING_DEVICE
+    const QPointingDevice* penDevice = event->pointingDevice();
+    const bool tipAndSideShareButton =
+        penDevice
+        && penDevice->name().compare(QStringLiteral("wmpointer"), Qt::CaseInsensitive) == 0;
+#else
+    const bool tipAndSideShareButton = false;
+#endif
     switch (event->type()) {
         case QEvent::TabletPress:
             peType = PointerEvent::Press;
@@ -4679,10 +4696,14 @@ void DocumentViewport::tabletEvent(QTabletEvent* event)
             // A tip lifted while a side button stays held can arrive as a move
             // with LeftButton dropped, rather than as a TabletRelease. Finalize
             // the in-flight stroke so a Hold-mapped eraser/pen does not stay
-            // stuck open until the button is released too.
+            // stuck open until the button is released too. Not on a backend
+            // that never sets LeftButton for a tip: there every move of a
+            // side-button stroke looks like this and the stroke would end on
+            // its first move.
             if (m_pointerActive && m_activeSource == PointerEvent::Stylus
                 && !(event->buttons() & Qt::LeftButton)
-                && (event->buttons() & (Qt::MiddleButton | Qt::RightButton))) {
+                && (event->buttons() & (Qt::MiddleButton | Qt::RightButton))
+                && !tipAndSideShareButton) {
                 peType = PointerEvent::Release;
                 break;
             }
@@ -4714,12 +4735,16 @@ void DocumentViewport::tabletEvent(QTabletEvent* event)
         // as the changed button; the eraser end is still a tip and reports
         // LeftButton too. Anything with a Middle/Right button but no tip is the
         // side button alone, in whichever field the driver chose to report it.
+        // That reasoning does not hold where the tip and the side button share
+        // one button (see tipAndSideShareButton): there a contact is a Press
+        // whose only button is the side button, and swallowing it would drop
+        // every stroke made while the button is held.
         const bool hasTipContact = (event->buttons() & Qt::LeftButton)
                                    || event->button() == Qt::LeftButton;
         const bool hasSideButton = (event->buttons() & (Qt::MiddleButton | Qt::RightButton))
                                    || event->button() == Qt::MiddleButton
                                    || event->button() == Qt::RightButton;
-        if (!hasTipContact && hasSideButton) {
+        if (!hasTipContact && hasSideButton && !tipAndSideShareButton) {
             event->accept();
             return;
         }

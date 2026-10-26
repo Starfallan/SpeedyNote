@@ -464,6 +464,7 @@ void DocumentViewport::setDocument(Document* doc)
     m_textSelection.clear();
     if (hadTextSelection) {
         emit textSelectionChanged(false);
+        updateInteractionSessionState();
     }
     clearTextBoxCache();
     clearLinkCache();  // Phase D.1
@@ -954,6 +955,7 @@ void DocumentViewport::setCurrentTool(ToolType tool)
         m_textSelection.clear();
         if (hadTextSelection) {
             emit textSelectionChanged(false);
+            updateInteractionSessionState();
         }
         clearTextBoxCache();
         clearLinkCache();  // Phase D.1
@@ -964,6 +966,10 @@ void DocumentViewport::setCurrentTool(ToolType tool)
     
     // Repaint for tool-specific visuals (eraser cursor, etc.)
     update();
+
+    // Switching tools can clear a selection directly (the lasso, object and text
+    // cleanup above), which closes the session without any pointer event.
+    updateInteractionSessionState();
     
     emit toolChanged(tool);
 }
@@ -1149,6 +1155,30 @@ bool DocumentViewport::hasActiveObjectPointerGesture() const
 bool DocumentViewport::hasObjectGestureInFlight() const
 {
     return m_isDraggingObjects || m_isResizingObject || m_isCreatingTextBox;
+}
+
+bool DocumentViewport::isInteractionSessionOpen() const
+{
+    // A contact that is still down is unfinished by definition: the user is
+    // drawing, dragging or lassoing right now.
+    if (m_pointerActive) return true;
+
+    // Work the user still has to act on before the canvas is free again.
+    if (m_isDrawingLasso || m_isTransformingSelection) return true;
+    if (m_lassoSelection.isValid()) return true;
+    if (hasObjectGestureInFlight() || !m_selectedObjects.isEmpty()) return true;
+    if (m_textSelection.isValid()) return true;
+
+    return false;
+}
+
+void DocumentViewport::updateInteractionSessionState()
+{
+    const bool open = isInteractionSessionOpen();
+    if (open == m_interactionSessionOpen) return;
+
+    m_interactionSessionOpen = open;
+    emit interactionSessionChanged(open);
 }
 
 void DocumentViewport::beginObjectPointerGesture(const PointerEvent& pe)
@@ -4121,6 +4151,7 @@ void DocumentViewport::selectAnnotation(LinkObject* annotation)
     const bool hadTextSelection = m_textSelection.isValid();
     m_textSelection.clear();
     if (hadTextSelection) emit textSelectionChanged(false);
+    updateInteractionSessionState();
 
     selectObject(annotation, false);
     update();
@@ -6274,6 +6305,9 @@ void DocumentViewport::handlePointerPress(const PointerEvent& pe)
         m_activeDrawingPage = -1;
     }
     
+    // The contact itself opens the session: until this release the tool is not
+    // finished, so nothing may switch it out from under the stroke.
+    updateInteractionSessionState();
     // Two-column UX: Update current page when touching a page with an editing tool
     // This ensures undo/redo operates on the page the user is actually editing,
     // not just the page at viewport center (which may be incorrect in 2-column mode)
@@ -6548,6 +6582,15 @@ void DocumentViewport::handlePointerRelease(const PointerEvent& pe)
     // Close the eraser's undo batch before any branch can return: the release
     // itself never erases, so this is the end of the pass.
     commitEraserGesture();
+
+    // Every branch below returns early, and each one ends the contact. Rather
+    // than re-evaluate the session at a dozen exits - the kind of missed exit
+    // that left an empty lasso stuck before - settle it once when this frame
+    // unwinds, whatever the contact turned out to be.
+    struct SessionSettler {
+        DocumentViewport* viewport;
+        ~SessionSettler() { viewport->updateInteractionSessionState(); }
+    } sessionSettler{this};
 
     // End of a swallowed post-paste dismissal contact: just clean up.
     if (m_suppressUntilRelease) {
@@ -8211,6 +8254,9 @@ void DocumentViewport::clearObjectSelection()
         m_pendingThumbnailPages.clear();
         emit objectSelectionChanged();
     }
+    // The selection may have been dropped by an action bar button or a key
+    // press, so the session has to be settled here as well.
+    updateInteractionSessionState();
     update();
 }
 
@@ -14281,6 +14327,7 @@ bool DocumentViewport::handleEscapeKey()
             m_textSelection.clear();
             if (hadValidSelection) {
                 emit textSelectionChanged(false);
+                updateInteractionSessionState();
             }
             update();
             return true;
@@ -14942,6 +14989,10 @@ void DocumentViewport::clearLassoSelection()
     if (hadSelection) {
         emit lassoSelectionChanged(false);
     }
+
+    // A cleared selection is how most sessions end, and the caller is often an
+    // action bar button or a key press rather than a pointer release.
+    updateInteractionSessionState();
     
     update();
 }
@@ -15220,6 +15271,7 @@ void DocumentViewport::setHighlighterMode(HighlighterMode mode)
     m_lastOcrHitBlockIndex = -1;
     if (hadSelection) {
         emit textSelectionChanged(false);
+        updateInteractionSessionState();
     }
 
     emit highlighterModeChanged(mode);
@@ -15543,6 +15595,7 @@ void DocumentViewport::handlePointerPress_Highlighter(const PointerEvent& pe)
         bool hadSelection = m_textSelection.isValid();
         m_textSelection.clear();
         if (hadSelection) emit textSelectionChanged(false);
+        updateInteractionSessionState();
         m_pointerActive = false;
     };
 
@@ -16102,6 +16155,7 @@ void DocumentViewport::handleOffPagePanTap()
             const bool hadTextSelection = m_textSelection.isValid();
             m_textSelection.clear();
             if (hadTextSelection) emit textSelectionChanged(false);
+            updateInteractionSessionState();
             if (!m_selectedObjects.isEmpty()) {
                 deselectAllObjects();
             }
@@ -17179,6 +17233,7 @@ void DocumentViewport::commitHighlightAdjust()
     if (m_textSelection.isValid()) {
         m_textSelection.clear();
         emit textSelectionChanged(false);
+        updateInteractionSessionState();
     }
 
     syncLinkObjectBar();
@@ -17199,6 +17254,7 @@ void DocumentViewport::discardHighlightAdjust()
     if (m_textSelection.isValid()) {
         m_textSelection.clear();
         emit textSelectionChanged(false);
+        updateInteractionSessionState();
     }
 }
 
@@ -17243,6 +17299,7 @@ void DocumentViewport::cancelHighlightAdjust()
     if (m_textSelection.isValid()) {
         m_textSelection.clear();
         emit textSelectionChanged(false);
+        updateInteractionSessionState();
     }
 
     syncLinkObjectBar();

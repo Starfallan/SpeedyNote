@@ -1139,26 +1139,32 @@ public:
     bool isHardwareEraserActive() const { return m_hardwareEraserActive; }
 
     /**
-     * @brief Check if a selection gesture is still in flight.
-     * @return True while a lasso path is being drawn or a selection transform
-     *         is in progress.
-     *
-     * A caller that is about to switch tools uses this to avoid judging the
-     * gesture by its result before the tool has been given the release event
-     * that turns the path into a selection.
-     */
-    bool isSelectionGestureActive() const {
-        return m_isDrawingLasso || m_isTransformingSelection;
-    }
-
-    /**
      * @brief Check if an object gesture is still in flight.
      * @return True while an object is being dragged, resized or created.
-     *
-     * Exposed next to isSelectionGestureActive() so a caller that is about to
-     * switch tools can tell a finished gesture from one that is still going.
      */
     bool hasObjectGestureInFlight() const;
+
+    /**
+     * @brief Check whether an interaction session is still open.
+     *
+     * A session spans everything the user has to finish before the canvas is
+     * free again: a contact that is still drawing, or a lasso/object/text
+     * selection that is still waiting to be acted on. It is the single place
+     * that answers "is this tool finished?", so callers do not have to infer
+     * it from selection-changed edges - which cannot express an empty lasso
+     * that produced nothing at all.
+     *
+     * @return True while a contact or an unprocessed selection remains.
+     */
+    bool isInteractionSessionOpen() const;
+
+    /**
+     * @brief Re-evaluate the session and emit interactionSessionChanged on a
+     *        real change. Called from the pointer callbacks and from every
+     *        place that clears a selection, so a session closed by an action
+     *        bar button or a key press is reported too.
+     */
+    void updateInteractionSessionState();
     
     // ===== Layout Engine (Task 1.3.2) =====
     
@@ -2976,6 +2982,16 @@ signals:
      * applicable button.
      */
     void textSelectionChanged(bool hasSelection);
+
+    /**
+     * @brief Emitted when the interaction session opens or closes.
+     * @param open True while a contact or an unprocessed selection remains.
+     *
+     * Authoritative state rather than an edge on one kind of selection: it also
+     * reports the empty-lasso and cleared-selection cases, which emit no
+     * selection-changed signal at all. Re-emitted only on an actual change.
+     */
+    void interactionSessionChanged(bool open);
     
     /**
      * @brief Emitted when internal stroke clipboard state changes.
@@ -3328,6 +3344,9 @@ private:
     QPointF m_lassoRectStart;            ///< Rectangle lasso first corner
     QPointF m_lassoRectCurrent;          ///< Rectangle lasso current opposite corner
     bool m_isDrawingLasso = false;       ///< Currently drawing a lasso path
+    /// Last value reported through interactionSessionChanged, so the signal
+    /// only fires on a real change.
+    bool m_interactionSessionOpen = false;
     
     // P1: Lasso path incremental rendering cache
     QPixmap m_lassoPathCache;            ///< Cached lasso path segments at viewport resolution

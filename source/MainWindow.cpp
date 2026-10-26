@@ -2442,17 +2442,9 @@ void MainWindow::connectViewportScrollSignals(DocumentViewport* viewport) {
         disconnect(m_textSelectionConn);
         m_textSelectionConn = {};
     }
-    if (m_stylusSelectionEndConn) {
-        disconnect(m_stylusSelectionEndConn);
-        m_stylusSelectionEndConn = {};
-    }
-    if (m_stylusObjectSelectionEndConn) {
-        disconnect(m_stylusObjectSelectionEndConn);
-        m_stylusObjectSelectionEndConn = {};
-    }
-    if (m_stylusTextSelectionEndConn) {
-        disconnect(m_stylusTextSelectionEndConn);
-        m_stylusTextSelectionEndConn = {};
+    if (m_stylusSessionConn) {
+        disconnect(m_stylusSessionConn);
+        m_stylusSessionConn = {};
     }
     if (m_strokeClipboardConn) {
         disconnect(m_strokeClipboardConn);
@@ -2688,28 +2680,14 @@ void MainWindow::connectViewportScrollSignals(DocumentViewport* viewport) {
     m_lassoSelectionConn = connect(viewport, &DocumentViewport::lassoSelectionChanged,
                                    m_actionBarContainer, &ActionBarContainer::onLassoSelectionChanged);
 
-    // A Hold-mapped Lasso/ObjectSelect/Highlighter is kept until its work is
-    // done: the selection it produced has to stay usable, including the action
-    // bar the user then clicks. Reverting on the next press would clear the
-    // selection and hide that bar out from under the click.
-    m_stylusSelectionEndConn = connect(
-        viewport, &DocumentViewport::lassoSelectionChanged, this,
-        [this](bool hasSelection) {
-            if (!hasSelection) onStylusSelectionEnded();
-        });
-    m_stylusObjectSelectionEndConn = connect(
-        viewport, &DocumentViewport::objectSelectionChanged, this,
-        [this, viewport]() {
-            if (!viewport->hasSelectedObjects()
-                && !viewport->hasObjectGestureInFlight()) {
-                onStylusSelectionEnded();
-            }
-        });
-    m_stylusTextSelectionEndConn = connect(
-        viewport, &DocumentViewport::textSelectionChanged, this,
-        [this](bool hasSelection) {
-            if (!hasSelection) onStylusSelectionEnded();
-        });
+    // The viewport owns the interaction session: a contact that is still down,
+    // or a lasso/object/text selection still waiting to be acted on. It is true
+    // across the several contacts a selection spans (draw the lasso, then click
+    // the action bar), and it reports the empty-lasso and cleared-selection
+    // cases that emit no selection-changed signal at all. This is the only
+    // input the postponed Hold revert listens to.
+    m_stylusSessionConn = connect(viewport, &DocumentViewport::interactionSessionChanged,
+                                  this, &MainWindow::onStylusInteractionSessionChanged);
 
     // Sync the recolor swatch on the LassoActionBar to the current pen color
     // every time a fresh selection appears, so the "default" target color
@@ -5180,10 +5158,11 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
     // it selects is the one that draws the very same event. Never consume the
     // event: the viewport still needs it.
     //
-    // A Hold revert postponed because the previous contact left a selection
-    // behind is not settled here on the next press: that press may be the user
-    // clicking the action bar the selection just opened. It is settled by
-    // onStylusSelectionEnded() instead, once the selection is really gone.
+    // A postponed Hold revert is not settled here: this filter runs before the
+    // viewport has handled the event, and the next press may well be the user
+    // clicking the action bar. The viewport reports when the interaction
+    // session is over through interactionSessionChanged, and that is the only
+    // thing this revert listens to.
     if (event->type() == QEvent::TabletPress
         || event->type() == QEvent::TabletRelease
         || event->type() == QEvent::TabletMove) {
@@ -5987,31 +5966,6 @@ void MainWindow::revertStylusButtonMapping(Qt::MouseButton button) {
     }
 }
 
-// A gesture that ends while a mapped tool is active only keeps its result if
-// that tool can still show and act on it. Lasso strokes, selected objects and
-// selected text all live in state the tool switch clears (see
-// DocumentViewport::setCurrentTool), so reverting right after such a gesture
-// would discard what the user just made. Pen, Marker and Eraser commit their
-// result before the release is over, so they revert immediately as before.
-bool MainWindow::stylusMappedToolHoldsWork() {
-    DocumentViewport* vp = m_stylusButtonMappedViewport;
-    if (!vp) return false;
-
-    // A revert can arrive before the viewport has seen the release that turns
-    // a lasso path into a selection, in which case there is nothing to check
-    // yet. Waiting is the only safe answer: reverting now loses the gesture.
-    if (vp->isSelectionGestureActive()) return true;
-
-    if (vp->hasLassoSelection() || vp->hasSelectedObjects()
-        || vp->hasTextSelection()) {
-        return true;
-    }
-
-    // An object drag/resize/create that is still running has not written its
-    // result yet; switching tools now would cancel it (cancelObjectPointerGesture).
-    return vp->hasObjectGestureInFlight();
-}
-
 void MainWindow::flushPendingStylusRevert() {
     const bool pendingA = m_stylusButtonAPendingRevert;
     const bool pendingB = m_stylusButtonBPendingRevert;
@@ -6022,26 +5976,12 @@ void MainWindow::flushPendingStylusRevert() {
     if (pendingB) revertStylusButtonMapping(m_stylusButtonBQt);
 }
 
-// The mapped tool's work is done once the selection it produced is gone: the
-// user deleted the strokes/objects, cleared the selection, or emptied it. Only
-// then does the Hold revert run, so the action bar the selection opened stays
-// clickable for as long as there is something to act on.
-void MainWindow::onStylusSelectionEnded() {
-    if (!m_stylusButtonAPendingRevert && !m_stylusButtonBPendingRevert) return;
-
-    DocumentViewport* vp = m_stylusButtonMappedViewport;
-    if (!vp) {
-        flushPendingStylusRevert();
-        return;
-    }
-
-    // A gesture that is still running has not produced its result yet, and a
-    // selection may have just been replaced by another one.
-    if (vp->isSelectionGestureActive() || vp->hasObjectGestureInFlight()) return;
-    if (vp->hasLassoSelection() || vp->hasSelectedObjects() || vp->hasTextSelection()) {
-        return;
-    }
-
+// The viewport reports the one thing this feature cannot infer: whether a tool
+// still has work in progress. No selection-changed edges, no guessing whether
+// the next press is on the action bar - the session is open while a contact is
+// down or a selection is waiting, and closed once the user is really done.
+void MainWindow::onStylusInteractionSessionChanged(bool open) {
+    if (open) return;
     flushPendingStylusRevert();
 }
 
@@ -6095,7 +6035,12 @@ void MainWindow::handleStylusTabletButtons(Qt::MouseButtons buttons,
                 if (pressEdge && !active) {
                     applyStylusButtonMapping(qtButton, viewport);
                 } else if (releaseEdge && active) {
-                    if (stylusMappedToolHoldsWork()) {
+                    // Hand the decision to the viewport: if the tool still has
+                    // work open (a contact being drawn, a selection waiting for
+                    // the action bar) the revert waits for
+                    // interactionSessionChanged(false).
+                    DocumentViewport* mapped = m_stylusButtonMappedViewport;
+                    if (mapped && mapped->isInteractionSessionOpen()) {
                         if (isA) {
                             m_stylusButtonAPendingRevert = true;
                         } else {

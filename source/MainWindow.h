@@ -1012,32 +1012,24 @@ private:
                                    bool isPress, DocumentViewport* viewport);
     void applyStylusButtonMapping(Qt::MouseButton button, DocumentViewport* viewport);
     void revertStylusButtonMapping(Qt::MouseButton button);
-    /// True when the gesture that just ended left something the mapped tool
-    /// keeps (lasso/object/text selection). Reverting the tool would clear it,
-    /// so the revert waits until that selection is dismissed.
-    bool stylusMappedToolHoldsWork();
-    /// Run a revert that was postponed by stylusMappedToolHoldsWork(), now that
-    /// the reason for postponing it is gone.
+    /// Run a revert that was postponed because the mapped tool still had work
+    /// open, now that the viewport reports the interaction session is over.
     void flushPendingStylusRevert();
-    /// Settles a postponed Hold revert once the selection the mapped tool made
-    /// is really gone (deleted, cleared, or replaced by nothing).
-    void onStylusSelectionEnded();
+    /// The viewport's verdict on whether the mapped tool still has work open.
+    void onStylusInteractionSessionChanged(bool open);
 
     // Viewport a Hold/Toggle mapping was applied to, so the revert reaches the
     // same pane even in split view. QPointer so a closed tab cannot dangle.
     QPointer<DocumentViewport> m_stylusButtonMappedViewport;
 
-    // Hold-mode revert postponed because the gesture left a selection behind.
-    // Two bits so a button pressed again before the revert ran still works: the
-    // pending revert is applied first, then the new mapping.
+    // Hold-mode revert postponed because the mapped tool still had work open.
+    // Two bits because the two side buttons are independent.
     bool m_stylusButtonAPendingRevert = false;
     bool m_stylusButtonBPendingRevert = false;
 
-    // Selection-ended hooks for the mapped viewport. Tracked so a viewport
-    // switch drops them instead of letting a stale pane revert the new one.
-    QMetaObject::Connection m_stylusSelectionEndConn;
-    QMetaObject::Connection m_stylusObjectSelectionEndConn;
-    QMetaObject::Connection m_stylusTextSelectionEndConn;
+    // The mapped viewport's interaction-session signal. Tracked so a viewport
+    // switch drops it instead of letting a stale pane revert the new one.
+    QMetaObject::Connection m_stylusSessionConn;
 };
 
 #endif // MAINWINDOW_H

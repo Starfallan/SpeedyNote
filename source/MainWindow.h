@@ -161,6 +161,11 @@ public:
     Qt::MouseButton getStylusButtonBQt() const { return m_stylusButtonBQt; }
     void setStylusButtonBQt(Qt::MouseButton button);
 
+    // Windows-only: suppresses the system ripple that appears when the pen
+    // touches the screen. No effect on other platforms.
+    bool isStylusContactAnimationDisabled() const { return m_stylusContactAnimationDisabled; }
+    void setStylusContactAnimationDisabled(bool disabled);
+
     // Scroll-bar placement settings (Plan SB4); delegate to SplitViewManager.
     // Page-axis (vertical) bar: false = left edge, true = right edge.
     bool scrollBarVerticalOnRight() const;
@@ -986,6 +991,10 @@ private:
 
     // ==================== Stylus Side Buttons ====================
     bool m_stylusButtonMappingEnabled = false;
+    // Windows draws a ripple when a pen touches the screen. It can be turned
+    // off per window through SetWindowFeedbackSetting, which is what this flag
+    // drives; other platforms ignore it.
+    bool m_stylusContactAnimationDisabled = false;
 
     // Button A / B configuration.
     ToolType m_stylusButtonATool = ToolType::Eraser;
@@ -1008,6 +1017,9 @@ private:
 
     void loadStylusButtonSettings();
     void saveStylusButtonSettings();
+    /// Push the contact-animation preference to the platform window. A no-op
+    /// outside Windows and until the window handle exists.
+    void applyStylusContactAnimationSetting();
     void handleStylusTabletButtons(Qt::MouseButtons buttons, Qt::MouseButton changedButton,
                                    bool isPress, DocumentViewport* viewport);
     void applyStylusButtonMapping(Qt::MouseButton button, DocumentViewport* viewport);

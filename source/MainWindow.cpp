@@ -5824,6 +5824,11 @@ void MainWindow::loadStylusButtonSettings() {
     m_stylusButtonBTool = (bTool >= 0 && bTool <= toolMax) ? static_cast<ToolType>(bTool)
                                                            : ToolType::Eraser;
 
+    // Off by default: the ripple is Windows' own behaviour, so it is only
+    // suppressed when the user asks for it.
+    m_stylusContactAnimationDisabled =
+        settings.value("stylus/disableContactAnimation", false).toBool();
+
     const int aMode = settings.value("stylus/buttonA/mode", static_cast<int>(StylusButtonMode::Hold)).toInt();
     const int bMode = settings.value("stylus/buttonB/mode", static_cast<int>(StylusButtonMode::Hold)).toInt();
     m_stylusButtonAMode = (aMode >= 0 && aMode <= modeMax) ? static_cast<StylusButtonMode>(aMode)
@@ -5856,6 +5861,39 @@ void MainWindow::saveStylusButtonSettings() {
     settings.setValue("stylus/buttonB/mode", static_cast<int>(m_stylusButtonBMode));
     settings.setValue("stylus/buttonA/qtButton", static_cast<int>(m_stylusButtonAQt));
     settings.setValue("stylus/buttonB/qtButton", static_cast<int>(m_stylusButtonBQt));
+    settings.setValue("stylus/disableContactAnimation", m_stylusContactAnimationDisabled);
+}
+
+void MainWindow::setStylusContactAnimationDisabled(bool disabled) {
+    m_stylusContactAnimationDisabled = disabled;
+    applyStylusContactAnimationSetting();
+    saveStylusButtonSettings();
+}
+
+// Windows draws a ripple where the pen touches the screen. It is a per-window
+// platform feedback setting, applied to this window's HWND.
+//
+// Only the four pen-tip feedback types are touched. FEEDBACK_PEN_BARRELVISUALIZATION
+// is left alone on purpose: it is the hover hint for the side button, not a
+// contact ripple. The FEEDBACK_TOUCH_* family is fingers, which keep their
+// native behaviour.
+void MainWindow::applyStylusContactAnimationSetting() {
+#ifdef Q_OS_WIN
+    if (!windowHandle()) return;  // Not created yet; showEvent() retries.
+    HWND hwnd = reinterpret_cast<HWND>(windowHandle()->winId());
+    const BOOL enable = m_stylusContactAnimationDisabled ? FALSE : TRUE;
+    const FEEDBACK_TYPE penTipFeedback[] = {
+        FEEDBACK_PEN_TAP,            // single tap ripple
+        FEEDBACK_PEN_DOUBLETAP,      // double-tap ripple
+        FEEDBACK_PEN_PRESSANDHOLD,   // press-and-hold ring
+        FEEDBACK_PEN_RIGHTTAP,       // right-tap ripple
+    };
+    for (const FEEDBACK_TYPE feedback : penTipFeedback) {
+        SetWindowFeedbackSetting(hwnd, feedback, 0, sizeof(enable), &enable);
+    }
+#else
+    Q_UNUSED(this);
+#endif
 }
 
 void MainWindow::setStylusButtonMappingEnabled(bool enabled) {
@@ -9006,6 +9044,10 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
 
 void MainWindow::showEvent(QShowEvent *event) {
     QMainWindow::showEvent(event);
+    // The HWND only exists once the window is shown, so the preference loaded
+    // from settings is pushed to the platform here (and re-pushed on every
+    // show, which is harmless).
+    applyStylusContactAnimationSetting();
 #ifdef Q_OS_IOS
     QTimer::singleShot(0, []{ IOSPlatformHelper::disableEditMenuOverlay(); });
 #endif

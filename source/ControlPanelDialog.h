@@ -139,6 +139,7 @@ private:
     QComboBox *stylusButtonBModeCombo = nullptr;
     QLabel *stylusButtonALabel = nullptr;
     QLabel *stylusButtonBLabel = nullptr;
+    QCheckBox *stylusContactAnimationCheckbox = nullptr;
     void createStylusTab();
     void detectStylusButton(bool isButtonA);
 };

@@ -2249,9 +2249,41 @@ void ControlPanelDialog::createStylusTab() {
     sideButtonNote->setStyleSheet("color: gray; font-size: 10px;");
     layout->addWidget(sideButtonNote);
 
+    // --- Windows pen contact animation ---
+    QLabel *contactAnimationSectionLabel = new QLabel(tr("Pen Contact Feedback"), stylusTab);
+    contactAnimationSectionLabel->setStyleSheet("font-weight: bold; font-size: 14px;");
+    layout->addSpacing(8);
+    layout->addWidget(contactAnimationSectionLabel);
+
+    stylusContactAnimationCheckbox = new QCheckBox(
+        tr("Hide the ripple Windows draws when the pen tip touches the screen"),
+        stylusTab);
+    stylusContactAnimationCheckbox->setChecked(
+        mainWindowRef->isStylusContactAnimationDisabled());
+#ifdef Q_OS_WIN
+    layout->addWidget(stylusContactAnimationCheckbox);
+
+    QLabel *contactAnimationNote = new QLabel(
+        tr("Windows draws this feedback itself. Only the pen tip ripples are "
+           "suppressed; the finger touch feedback and the side button hover hint "
+           "stay as they are."), stylusTab);
+    contactAnimationNote->setWordWrap(true);
+    contactAnimationNote->setStyleSheet("color: gray; font-size: 10px;");
+    layout->addWidget(contactAnimationNote);
+#else
+    // Only Windows has a system pen contact animation to switch off.
+    stylusContactAnimationCheckbox->setEnabled(false);
+    stylusContactAnimationCheckbox->setToolTip(
+        tr("Only applies to Windows."));
+    layout->addWidget(stylusContactAnimationCheckbox);
+#endif
+
     // --- Apply immediately ---
     connect(stylusButtonMappingCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
         mainWindowRef->setStylusButtonMappingEnabled(checked);
+    });
+    connect(stylusContactAnimationCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        mainWindowRef->setStylusContactAnimationDisabled(checked);
     });
     connect(stylusButtonAToolCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) { mainWindowRef->setStylusButtonActionA(index); });

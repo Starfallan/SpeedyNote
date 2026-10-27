@@ -1873,6 +1873,26 @@ Le bouton pressé sera assigné à %1.</translation>
         <source>Default Background</source>
         <translation>Arrière-plan par défaut</translation>
     </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2253"/>
+        <source>Pen Contact Feedback</source>
+        <translation>Retour au contact du stylet</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2259"/>
+        <source>Hide the ripple Windows draws when the pen tip touches the screen</source>
+        <translation>Masquer l'onde dessinée par Windows lorsque la pointe du stylet touche l'écran</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2267"/>
+        <source>Windows draws this feedback itself. Only the pen tip ripples are suppressed; the finger touch feedback and the side button hover hint stay as they are.</source>
+        <translation>Windows dessine lui-même ce retour visuel. Seules les ondes de la pointe du stylet sont supprimées ; le retour au toucher des doigts et l'indication de survol du bouton latéral restent inchangés.</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2277"/>
+        <source>Only applies to Windows.</source>
+        <translation>S'applique uniquement à Windows.</translation>
+    </message>
 </context>
 <context>
     <name>CopyPagesToDocDialog</name>

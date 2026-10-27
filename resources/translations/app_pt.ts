@@ -1873,6 +1873,26 @@ O botão premido será atribuído a %1.</translation>
         <source>Default Background</source>
         <translation>Plano de Fundo Padrão</translation>
     </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2253"/>
+        <source>Pen Contact Feedback</source>
+        <translation>Resposta ao contacto da caneta</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2259"/>
+        <source>Hide the ripple Windows draws when the pen tip touches the screen</source>
+        <translation>Ocultar a onda que o Windows desenha quando a ponta da caneta toca no ecrã</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2267"/>
+        <source>Windows draws this feedback itself. Only the pen tip ripples are suppressed; the finger touch feedback and the side button hover hint stay as they are.</source>
+        <translation>Esta resposta é desenhada pelo próprio Windows. Apenas as ondas da ponta da caneta são suprimidas; a resposta ao toque dos dedos e a indicação de cursor do botão lateral ficam como estão.</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2277"/>
+        <source>Only applies to Windows.</source>
+        <translation>Aplica-se apenas ao Windows.</translation>
+    </message>
 </context>
 <context>
     <name>CopyPagesToDocDialog</name>

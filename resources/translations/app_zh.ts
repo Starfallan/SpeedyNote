@@ -1708,6 +1708,26 @@ The button you press is assigned to %1.</source>
         <source>About</source>
         <translation type="unfinished">关于</translation>
     </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2253"/>
+        <source>Pen Contact Feedback</source>
+        <translation type="unfinished">笔尖接触反馈</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2259"/>
+        <source>Hide the ripple Windows draws when the pen tip touches the screen</source>
+        <translation type="unfinished">隐藏 Windows 在笔尖接触屏幕时绘制的波纹</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2267"/>
+        <source>Windows draws this feedback itself. Only the pen tip ripples are suppressed; the finger touch feedback and the side button hover hint stay as they are.</source>
+        <translation type="unfinished">该反馈由 Windows 自身绘制。此处仅关闭笔尖的波纹，手指触控反馈与侧键悬停提示保持不变。</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2277"/>
+        <source>Only applies to Windows.</source>
+        <translation type="unfinished">仅对 Windows 生效。</translation>
+    </message>
 </context>
 <context>
     <name>CopyPagesToDocDialog</name>

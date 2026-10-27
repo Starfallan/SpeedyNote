@@ -1873,6 +1873,26 @@ Die gedrückte Taste wird %1 zugewiesen.</translation>
         <source>Default Background</source>
         <translation>Standard-Hintergrund</translation>
     </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2253"/>
+        <source>Pen Contact Feedback</source>
+        <translation>Stiftkontakt-Rückmeldung</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2259"/>
+        <source>Hide the ripple Windows draws when the pen tip touches the screen</source>
+        <translation>Die Wellenanimation ausblenden, die Windows beim Aufsetzen der Stiftspitze zeichnet</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2267"/>
+        <source>Windows draws this feedback itself. Only the pen tip ripples are suppressed; the finger touch feedback and the side button hover hint stay as they are.</source>
+        <translation>Diese Rückmeldung zeichnet Windows selbst. Unterdrückt werden nur die Wellen der Stiftspitze; die Rückmeldung für Fingertipps und der Schwebehinweis der Seitentaste bleiben unverändert.</translation>
+    </message>
+    <message>
+        <location filename="../../source/ControlPanelDialog.cpp" line="2277"/>
+        <source>Only applies to Windows.</source>
+        <translation>Gilt nur unter Windows.</translation>
+    </message>
 </context>
 <context>
     <name>CopyPagesToDocDialog</name>

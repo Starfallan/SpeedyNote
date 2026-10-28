@@ -458,6 +458,9 @@ void DocumentViewport::setDocument(Document* doc)
     m_currentPageIndex = 0;
     m_needsPositionRestore = false;  // Reset deferred restore flag for new document
     m_edgelessPositionHistory.clear();  // Clear old position history for new document
+    // The render regime is latched; the zoom just went back to 100%, so the
+    // previous document's decision no longer describes this view.
+    refreshPdfTiledMode();
     
     // Track if we need to defer update for edgeless position restore
     bool deferUpdateForEdgeless = false;
@@ -1225,17 +1228,7 @@ void DocumentViewport::setZoomLevel(qreal zoom)
     const bool wasTiled = usesTiledPdfRender();
     m_zoomLevel = zoom;
     qreal newDpi = effectivePdfDpi();
-    
-    // Invalidate PDF cache if DPI changed significantly (Task 1.3.6).
-    // Above the whole-page cap the page DPI stops moving with the zoom
-    // (it is pinned at the cap), but the high-DPI tiles are keyed on the
-    // uncapped DPI -- so any zoom step in the tiled regime drops them too,
-    // instead of holding viewport-sized pixmaps that can no longer be shown.
-    const bool isTiled = usesTiledPdfRender();
-    if (!qFuzzyCompare(oldDpi, newDpi) || wasTiled != isTiled || (wasTiled && isTiled)) {
-        invalidatePdfCache();
-    }
-    
+
     // Note: Stroke caches are zoom-aware and will rebuild automatically
     // when ensureStrokeCacheValid() is called with the new zoom level.
     // No explicit invalidation needed - just lazy rebuild on next paint.
@@ -1248,6 +1241,24 @@ void DocumentViewport::setZoomLevel(qreal zoom)
 
     // Clamp pan offset (bounds change with zoom)
     clampPanOffset();
+
+    // The tiled regime depends on the zoom and on which pages are visible, so it
+    // is re-derived here -- after the pan clamp, so the visible set is final --
+    // and not on the paint path, which must never touch page geometry or the
+    // provider. refreshPdfTiledMode() carries hysteresis on the way out.
+    refreshPdfTiledMode();
+    const bool isTiled = usesTiledPdfRender();
+
+    // Invalidate PDF cache if DPI changed significantly (Task 1.3.6).
+    // Crossing the tiled boundary also invalidates: below it the whole-page
+    // pixmaps are what gets painted, above it they cannot be sharp. Inside the
+    // tiled regime the whole-page DPI stops moving with the zoom (it is pinned
+    // at the cap), so only the tiles -- keyed on the uncapped DPI -- go stale.
+    if (!qFuzzyCompare(oldDpi, newDpi) || wasTiled != isTiled) {
+        invalidatePdfCache();
+    } else if (wasTiled && isTiled) {
+        invalidatePdfTileCache();
+    }
     
     update();
     emit zoomChanged(m_zoomLevel);
@@ -3643,6 +3654,10 @@ void DocumentViewport::resizeEvent(QResizeEvent* event)
     
     // Check if auto-layout should switch modes based on new viewport width
     checkAutoLayout();
+
+    // A resize changes which pages are visible, and the tiled-regime latch depends
+    // on that (see refreshPdfTiledMode()).
+    refreshPdfTiledMode();
     
     // Emit signals and repaint
     emit panChanged(m_panOffset);
@@ -4728,6 +4743,11 @@ void DocumentViewport::zoomAtPoint(qreal newZoom, QPointF viewportPt)
     
     clampPanOffset();
     updateCurrentPageIndex();
+
+    // The render regime is latched, so every path that mutates the zoom has to
+    // re-derive it -- otherwise the paint path would keep using the previous
+    // branch and, after leaving the tiled regime, blit tiles that no longer exist.
+    refreshPdfTiledMode();
     
     // Check if auto-layout should switch modes (zoom level changed)
     checkAutoLayout();
@@ -4873,6 +4893,12 @@ void DocumentViewport::endZoomGesture()
     // Clamp and emit signals
     clampPanOffset();
     updateCurrentPageIndex();
+
+    // Re-derive the render regime now that the final zoom and pan are known.
+    // updatePdfCacheCapacity() below does this as well, but doing it here keeps
+    // the latch right for the repaint scheduled a few lines down instead of
+    // depending on that call's position.
+    refreshPdfTiledMode();
     
     emit zoomChanged(m_zoomLevel);
     emit panChanged(m_panOffset);
@@ -5378,10 +5404,18 @@ void DocumentViewport::doAsyncPdfPreload()
         // Track watcher for cleanup
         m_activePdfWatchers.append(watcher);
         
+        // Same supersede token as the tile path: invalidatePdfCache() bumps it, so
+        // a render that was already running when the document, source or zoom
+        // changed cannot be inserted afterwards (cancelling the watcher does not
+        // wait for the rasterisation, so the finished signal can still arrive).
+        const quint64 generation = m_pdfTileGeneration->load();
+        const auto generationToken = m_pdfTileGeneration;
+
         // THREAD SAFETY FIX: QPixmap must only be created on the main thread.
         // The background thread returns QImage, and we convert to QPixmap here
         // in the finished handler which runs on the main thread.
-        connect(watcher, &QFutureWatcher<QImage>::finished, this, [this, watcher, sourceId, pdfPageNum, dpi]() {
+        connect(watcher, &QFutureWatcher<QImage>::finished, this,
+                [this, watcher, sourceId, pdfPageNum, dpi, generation, generationToken]() {
             // BUG-A006 FIX: Check if watcher was cancelled (e.g., by invalidatePdfCache)
             // This happens when document/page changes while render is in progress
             m_activePdfWatchers.removeOne(watcher);
@@ -5393,7 +5427,7 @@ void DocumentViewport::doAsyncPdfPreload()
             }
             delete watcher;
             
-            if (wasCancelled) {
+            if (wasCancelled || generation != generationToken->load()) {
                 return;
             }
             
@@ -5503,37 +5537,61 @@ void DocumentViewport::invalidatePdfCache()
         m_pdfPreloadTimer->stop();
     }
     
-    // Cancel active background PDF render threads but don't wait (non-blocking).
-    // Watchers remain in m_activePdfWatchers so the destructor or
-    // cancelAndWaitForBackgroundThreads() can properly wait for them.
+    // Every outstanding render now produces an image the view can no longer show:
+    // bump the generation so workers bail before rasterising and finished
+    // handlers discard whatever is already in flight.
+    supersedePdfTiles();
+
+    // Thread-safe cache clear. The tile cache is cleared without holding this
+    // mutex; the lock order is page -> tile everywhere.
+    {
+        QMutexLocker locker(&m_pdfCacheMutex);
+#ifdef SPEEDYNOTE_DEBUG
+        if (!m_pdfCache.isEmpty()) {
+            qDebug() << "PDF CACHE INVALIDATED: cleared" << m_pdfCache.size() << "entries";
+        }
+#endif
+        m_pdfCache.clear();
+        m_cachedDpi = 0;
+    }
+
+    invalidatePdfTileCache();
+    m_pdfPageSizePtCache.clear();
+}
+
+void DocumentViewport::supersedePdfTiles()
+{
+    // Renderers already inside fz_run_page() cannot be interrupted (there is no
+    // cooperative cancellation point), so this is a discard, not a cancel: the
+    // worker gives up before starting, and the finished handler drops the result.
+    ++(*m_pdfTileGeneration);
+
     for (QFutureWatcher<QImage>* watcher : m_activePdfWatchers) {
         watcher->cancel();
     }
-    
-    // Thread-safe cache clear
-    QMutexLocker locker(&m_pdfCacheMutex);
-#ifdef SPEEDYNOTE_DEBUG
-    if (!m_pdfCache.isEmpty()) {
-        qDebug() << "PDF CACHE INVALIDATED: cleared" << m_pdfCache.size() << "entries";
-    }
-#endif
-    m_pdfCache.clear();
-    m_cachedDpi = 0;
 
-    // High-DPI tiles belong to the same document/source set; drop them too, and
-    // forget in-flight keys so the new document can request the same regions.
-    // Done in a nested scope so the page-cache mutex is not held while taking
-    // the tile mutex (they are never taken in the opposite order).
-    m_pdfTilesInFlight.clear();
-    {
-        QMutexLocker tileLocker(&m_pdfTileCacheMutex);
+    // Deliberately NOT clearing m_pdfTilesInFlight: each key is retired by the
+    // handler that created it. Clearing it here let a new request for the same
+    // region start while the old one was still running, and then the old
+    // handler removed the new request's key -- so the same region could be
+    // rasterised three times over for one zoom step.
+}
+
+void DocumentViewport::invalidatePdfTileCache()
+{
+    // Any zoom step changes the tile DPI, so outstanding requests belong to a
+    // regime that is no longer being shown. Bumping the generation is what lets
+    // them be dropped instead of being inserted under the old DPI (where they
+    // would only occupy cache slots until the next prune).
+    ++(*m_pdfTileGeneration);
+
+    QMutexLocker locker(&m_pdfTileCacheMutex);
 #ifdef SPEEDYNOTE_DEBUG
-        if (!m_pdfTileCache.isEmpty()) {
-            qDebug() << "PDF TILE CACHE INVALIDATED: cleared" << m_pdfTileCache.size() << "entries";
-        }
-#endif
-        m_pdfTileCache.clear();
+    if (!m_pdfTileCache.isEmpty()) {
+        qDebug() << "PDF TILE CACHE INVALIDATED: cleared" << m_pdfTileCache.size() << "entries";
     }
+#endif
+    m_pdfTileCache.clear();
 }
 
 void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageIndex)
@@ -5551,6 +5609,12 @@ void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageI
 
 void DocumentViewport::invalidatePdfTileCachePage(const QString& sourceId, int pageIndex)
 {
+    // Supersede first: a request for this page that is already rasterising would
+    // otherwise pass the generation check and insert the old content again.
+    // Coarser than needed (it drops in-flight work for every page), but this is
+    // only reached when a page's source or mapping changes.
+    ++(*m_pdfTileGeneration);
+
     QMutexLocker locker(&m_pdfTileCacheMutex);
     m_pdfTileCache.erase(
         std::remove_if(m_pdfTileCache.begin(), m_pdfTileCache.end(),
@@ -5587,6 +5651,12 @@ void DocumentViewport::updatePdfCacheCapacity()
             evictFurthestCacheEntries();
         }
     }
+
+    // Visible pages / zoom may both have changed, so re-derive the render regime
+    // before sizing the tile cache. This is the one place that runs on every
+    // zoom, layout and scroll-settle change, which is why the latch is refreshed
+    // here rather than in the paint path.
+    refreshPdfTiledMode();
 
     // Keep the high-DPI tile cache in step. Kept as a separate call (rather than
     // nested inside the page-cache lock) so the lock order stays page -> tile.
@@ -19254,14 +19324,10 @@ void DocumentViewport::renderPage(QPainter& painter, Page* page, int pageIndex)
                 const int resolvedPage = m_document->resolveSourcePageIndex(page->pdfSourceId, page->pdfPageNumber);
                 if (prov && prov->isValid() && resolvedPage >= 0 && resolvedPage < prov->pageCount()) {
                     if (usesTiledPdfRender()) {
-                        // Above the whole-page DPI cap. Draw what is already
-                        // cached and never render here: a full-page render at
-                        // this zoom would be both useless (it cannot be sharp)
-                        // and enormous. The settle handler renders the regions.
-                        QPixmap base = lookupAnyCachedPdfPage(page->pdfSourceId, page->pdfPageNumber);
-                        if (!base.isNull()) {
-                            painter.drawPixmap(pageRect.toRect(), base);
-                        }
+                        // Tiled regime. Draw what is already cached and never
+                        // render here: a whole-page render at this zoom cannot be
+                        // sharp and would be enormous. The settle handler renders
+                        // the regions; this path only blits them.
                         drawCachedPdfTiles(painter, page, pageIndex, pageRect);
                     } else {
                         qreal dpi = effectivePdfDpi();
@@ -19903,22 +19969,142 @@ qreal DocumentViewport::effectivePdfDpi() const
 
 bool DocumentViewport::usesTiledPdfRender() const
 {
-    return requiredPdfDpi() > kPdfDpiCap;
+    return m_pdfTiledActive;
+}
+
+void DocumentViewport::refreshPdfTiledMode()
+{
+    const qreal required = requiredPdfDpi();
+
+    // Clarity term: past kPdfDpiCap a whole-page bitmap has to be stretched, so
+    // the screen cannot get the detail it asks for. Hysteresis keeps a zoom step
+    // that lands on the boundary from flipping the render mode every notch.
+    const qreal clarityLimit = kPdfDpiCap *
+        (m_pdfTiledActive ? kPdfTiledExitDpiFactor : 1.0);
+    const bool clarityExceeded = required > clarityLimit;
+
+    // Safety term: a whole-page raster above the budget is refused by the
+    // backend (64 MP), which blanks the page. This is independent of the DPI
+    // cap, because the DPI at which it bites scales with the page's physical
+    // size: an A0 sheet is over budget at ~208 DPI, well inside the cap, which
+    // is exactly the range the old fixed threshold left blank.
+    //
+    // Evaluated at the DPI a whole-page render would actually use (the capped
+    // one), so the term is zoom-invariant and cannot oscillate on a zoom step.
+    double worstPixels = 0.0;
+    bool sawPdfPage = false;
+    if (m_document) {
+        for (int idx : visiblePages()) {
+            const Page* page = m_document->page(idx);
+            if (!page || page->backgroundType != Page::BackgroundType::PDF) {
+                continue;
+            }
+            sawPdfPage = true;
+            worstPixels = qMax(worstPixels, estimatedWholePagePixels(page));
+        }
+    }
+    if (!sawPdfPage) {
+        // Nothing PDF is on screen (page gap, overscroll, or no document yet).
+        // Keep the current regime: dropping it here would invalidate both caches
+        // over a transient gap and force a full rebuild on the next settle, for
+        // no visible gain.
+        return;
+    }
+    const double pixelBudget = kPdfWholePageMaxPixels *
+        (m_pdfTiledActive ? kPdfWholePageExitFactor : 1.0);
+    const bool safetyExceeded = worstPixels > pixelBudget;
+
+    m_pdfTiledActive = clarityExceeded || safetyExceeded;
+}
+
+QSizeF DocumentViewport::pdfPageSizePt(const Page* page) const
+{
+    // The provider's own page geometry. Page::size is persisted metadata that
+    // nothing re-validates on load, while the backend rasters from
+    // fz_bound_page(), so a relinked or replaced PDF can disagree with it.
+    // Memoised because pageSize() loads the page under the provider mutex, which
+    // is far too expensive for a predicate evaluated on every settle.
+    // An empty source id is the primary PDF, not a missing one: Document treats
+    // QString() as primarySource() everywhere (pdfSourceById, pdfPageSize).
+    if (!page || !m_document) {
+        return QSizeF();
+    }
+    const QString key = page->pdfSourceId + QLatin1Char('|') +
+                        QString::number(page->pdfPageNumber);
+    auto it = m_pdfPageSizePtCache.constFind(key);
+    if (it != m_pdfPageSizePtCache.constEnd()) {
+        return it.value();
+    }
+    const QSizeF ptSize = m_document->pdfPageSize(page->pdfSourceId, page->pdfPageNumber);
+    m_pdfPageSizePtCache.insert(key, ptSize);
+    return ptSize;
+}
+
+double DocumentViewport::estimatedWholePagePixels(const Page* page) const
+{
+    if (!page || page->size.width() <= 0.0 || page->size.height() <= 0.0) {
+        return 0.0;
+    }
+
+    const QSizeF ptSize = pdfPageSizePt(page);
+    double widthPt  = ptSize.width();
+    double heightPt = ptSize.height();
+    if (!(widthPt > 0.0) || !(heightPt > 0.0)) {
+        // No provider (or a page the source cannot serve): fall back to the
+        // page's own geometry. 96 page units = 72 points.
+        constexpr double kUnitsToPoints = 72.0 / 96.0;
+        widthPt  = page->size.width()  * kUnitsToPoints;
+        heightPt = page->size.height() * kUnitsToPoints;
+    }
+
+    const double dpi = qMin(requiredPdfDpi(), kPdfDpiCap);
+    const double px = widthPt  * dpi / 72.0;
+    const double py = heightPt * dpi / 72.0;
+    return px * py;
 }
 
 qreal DocumentViewport::pdfTileDpi() const
 {
-    // A tile is viewport-sized, so its DPI can follow the screen exactly. The
-    // ceiling only guards a pathological window/zoom, and the pixel budget in
-    // pdfTileRegionForPage() bounds the allocation itself.
+    // One DPI per view state -- deliberately not per region. A DPI derived from
+    // the region actually computed would drift as the user pans (the snapped
+    // region moves by up to one quantum, and near a page edge the visible part
+    // shrinks), and every drift would miss the cache and force a re-render even
+    // though the cached tile still covers the viewport.
+    //
+    // So the pixel budget is evaluated against an upper bound on any region this
+    // viewport can ask for:
+    //  - the visible rect is clamped to the page, so it is never larger than the
+    //    viewport itself;
+    //  - computeRegion() adds the margin and then rounds outwards to the quantum
+    //    grid -- floor() on the low edge and ceil() on the high edge, i.e. just
+    //    under two quanta of growth per axis -- and clamps to the page (which can
+    //    only shrink it).
+    // So the bound is the viewport box rounded up to the grid plus two quanta,
+    // which bounds every region computeRegion() can produce while staying
+    // invariant under panning.
+    // effectiveTileDpi() then lowers the DPI until that box fits kPdfTileMaxPixels:
+    // trading sharpness for a bounded allocation beats refusing to draw at all.
+    const qreal dpr = devicePixelRatioF();
+    const double deviceScale = m_zoomLevel * dpr;
+    if (!(deviceScale > 0.0)) {
+        return 0.0;
+    }
+    const auto snappedUnits = [deviceScale](double devicePx) {
+        const double raw = (devicePx + 2.0 * kPdfTileMarginPx) / deviceScale;
+        // +2 quanta: floor() and ceil() each round by up to one quantum.
+        return (std::ceil(raw / kPdfTileQuantumUnits) + 2.0) * kPdfTileQuantumUnits;
+    };
+
     return PdfTileGeometry::effectiveTileDpi(requiredPdfDpi(), kPdfTileMaxDpi,
-                                             0.0, 0.0, 0.0);
+                                             snappedUnits(width() * dpr),
+                                             snappedUnits(height() * dpr),
+                                             kPdfTileMaxPixels);
 }
 
-PdfTileGeometry::TileRegion DocumentViewport::pdfTileRegionForPage(const Page* page, int pageIndex,
-                                                                   qreal tileDpi) const
+PdfTileGeometry::TileRegion DocumentViewport::pdfTileRegionForPage(const Page* page,
+                                                                  int pageIndex) const
 {
-    if (!page || !m_document || tileDpi <= 0.0) {
+    if (!page || !m_document) {
         return {};
     }
 
@@ -19927,19 +20113,35 @@ PdfTileGeometry::TileRegion DocumentViewport::pdfTileRegionForPage(const Page* p
 
     PdfTileGeometry::Params params;
     params.deviceScale = m_zoomLevel * devicePixelRatioF();
-    params.tileDpi = tileDpi;
     params.quantumUnits = kPdfTileQuantumUnits;
     params.marginPx = kPdfTileMarginPx;
 
+    // computeRegion() is independent of the render DPI, so the region is derived
+    // first and the DPI is derived from the viewport, not from this region (see
+    // pdfTileDpi()). Refusing an over-budget region instead would blank the page,
+    // which is never the right answer.
     PdfTileGeometry::TileRegion region = PdfTileGeometry::computeRegion(
         page->size.width(), page->size.height(),
         vis.x(), vis.y(), vis.width(), vis.height(), params);
+    if (!region.valid) {
+        return region;
+    }
 
-    // The region is viewport-sized, so this only bites for an extreme
-    // window/zoom combination; it mirrors the backend's own raster guard.
-    if (region.valid &&
-        region.pixelWidth(tileDpi) * region.pixelHeight(tileDpi) > kPdfTileMaxPixels) {
-        return {};
+    // computeRegion() converts page units to PDF points at a fixed 72/96. That is
+    // only right while Page::size agrees with the source's own geometry: the size
+    // is persisted metadata and is not re-validated on load, so a relinked or
+    // replaced PDF can disagree. The backend rasters the points rect, while the
+    // view draws the units rect, so a mismatch would silently rasterise the wrong
+    // part of the page. Map through the real ratio when the provider knows its
+    // own geometry, and keep the fixed ratio only as the fallback.
+    const QSizeF ptSize = pdfPageSizePt(page);
+    if (ptSize.width() > 0.0 && ptSize.height() > 0.0) {
+        const double xPtPerUnit = ptSize.width()  / page->size.width();
+        const double yPtPerUnit = ptSize.height() / page->size.height();
+        region.xPt = region.xUnits * xPtPerUnit;
+        region.yPt = region.yUnits * yPtPerUnit;
+        region.wPt = region.wUnits * xPtPerUnit;
+        region.hPt = region.hUnits * yPtPerUnit;
     }
     return region;
 }
@@ -19957,21 +20159,6 @@ QVector<PdfTileEntry> DocumentViewport::lookupCachedPdfTiles(const QString& sour
     return hits;
 }
 
-QPixmap DocumentViewport::lookupAnyCachedPdfPage(const QString& sourceId, int pageIndex) const
-{
-    // Deliberately DPI-agnostic: while the sharp tile for the current zoom is
-    // still rendering, the previous page-level render (any DPI) is a better
-    // placeholder than a blank page -- it is exactly what the viewport showed
-    // before this fix. Tiles are then painted on top of it.
-    QMutexLocker locker(&m_pdfCacheMutex);
-    for (const PdfCacheEntry& entry : m_pdfCache) {
-        if (entry.sourceId == sourceId && entry.pageIndex == pageIndex && !entry.pixmap.isNull()) {
-            return entry.pixmap;
-        }
-    }
-    return QPixmap();
-}
-
 void DocumentViewport::drawCachedPdfTiles(QPainter& painter, const Page* page, int pageIndex,
                                           const QRectF& pageRect)
 {
@@ -19979,6 +20166,8 @@ void DocumentViewport::drawCachedPdfTiles(QPainter& painter, const Page* page, i
         return;
     }
 
+    // One DPI per view state, shared with doAsyncPdfTilePreload(), so the lookup
+    // finds what the request produced regardless of the exact snapped region.
     const qreal tileDpi = pdfTileDpi();
     if (tileDpi <= 0.0) {
         return;
@@ -20062,22 +20251,18 @@ void DocumentViewport::insertPdfTile(const PdfTileEntry& entry)
 
 void DocumentViewport::prunePdfTiles()
 {
-    const bool tiled = usesTiledPdfRender();
-    const qreal wantDpi = pdfTileDpi();
-    const bool keepAny = tiled && wantDpi > 0.0;
+    // Below the tiled regime no tile can be painted at all, so the whole cache
+    // goes (this also supersedes outstanding requests).
+    if (!usesTiledPdfRender()) {
+        invalidatePdfTileCache();
+        return;
+    }
 
-    QMutexLocker locker(&m_pdfTileCacheMutex);
-    m_pdfTileCache.erase(
-        std::remove_if(m_pdfTileCache.begin(), m_pdfTileCache.end(),
-                       [keepAny, wantDpi](const PdfTileEntry& entry) {
-                           // Below the cap the tiles cannot be shown at all;
-                           // above it only the current tile DPI is paintable.
-                           if (!keepAny) {
-                               return true;
-                           }
-                           return !qFuzzyCompare(entry.dpi, wantDpi);
-                       }),
-        m_pdfTileCache.end());
+    // Inside the regime there is no single "current tile DPI" to compare against
+    // any more -- each region derives its own from its own size -- and a stale
+    // entry cannot be painted by mistake: lookupCachedPdfTiles() matches the DPI
+    // exactly and the coverage test rejects anything rendered for another zoom.
+    // Capacity and distance-based eviction handle the rest.
 }
 
 void DocumentViewport::doAsyncPdfTilePreload()
@@ -20088,11 +20273,6 @@ void DocumentViewport::doAsyncPdfTilePreload()
 
     const QVector<int> visible = visiblePages();
     if (visible.isEmpty()) {
-        return;
-    }
-
-    const qreal tileDpi = pdfTileDpi();
-    if (tileDpi <= 0.0) {
         return;
     }
 
@@ -20114,8 +20294,13 @@ void DocumentViewport::doAsyncPdfTilePreload()
             continue;
         }
 
-        const PdfTileGeometry::TileRegion region = pdfTileRegionForPage(page, pageIdx, tileDpi);
+        const PdfTileGeometry::TileRegion region = pdfTileRegionForPage(page, pageIdx);
         if (!region.valid) {
+            continue;
+        }
+
+        const qreal tileDpi = pdfTileDpi();
+        if (tileDpi <= 0.0) {
             continue;
         }
 
@@ -20163,10 +20348,17 @@ void DocumentViewport::doAsyncPdfTilePreload()
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
         m_activePdfWatchers.append(watcher);
 
+        // Snapshot the generation this request belongs to. The worker bails out
+        // before rasterising if it has already been superseded, and the finished
+        // handler discards the result if it was superseded meanwhile.
+        const quint64 generation = m_pdfTileGeneration->load();
+        const auto generationToken = m_pdfTileGeneration;
+
         // QPixmap must only be created on the main thread, so the worker returns
         // a QImage and the conversion happens here in the finished handler.
         connect(watcher, &QFutureWatcher<QImage>::finished, this,
-                [this, watcher, key, sourceId, pdfPageNum, tileDpi, regionPt, regionUnits]() {
+                [this, watcher, key, sourceId, pdfPageNum, tileDpi, regionPt, regionUnits,
+                 generation, generationToken]() {
             m_activePdfWatchers.removeOne(watcher);
             m_pdfTilesInFlight.remove(key);
 
@@ -20177,7 +20369,13 @@ void DocumentViewport::doAsyncPdfTilePreload()
             }
             delete watcher;
 
-            if (wasCancelled || tileImage.isNull() || !m_document) {
+            // Superseded while rendering: the view has moved on (or the zoom
+            // changed), so the image describes a state that is no longer wanted.
+            // Dropping it here is the whole of "cancellation" -- MuPDF has no
+            // cooperative cancellation point, so work already inside
+            // fz_run_page() always runs to completion.
+            if (wasCancelled || generation != generationToken->load() ||
+                tileImage.isNull() || !m_document) {
                 return;
             }
 
@@ -20190,9 +20388,14 @@ void DocumentViewport::doAsyncPdfTilePreload()
                 if (!m_skipImageMasking) {
                     const QVector<QRect> pageRegions =
                         m_document->pdfImageRegions(sourceId, pdfPageNum, tileDpi);
-                    const qreal pxPerUnit = tileDpi / 96.0;
-                    const int originX = qRound(regionUnits.x() * pxPerUnit);
-                    const int originY = qRound(regionUnits.y() * pxPerUnit);
+                    // pdfImageRegions() runs the page through fz_scale(dpi/72),
+                    // so its rects live in pt->px space, not units->px space.
+                    // The tile origin has to be computed in the same space, or
+                    // the mask shifts whenever Page::size disagrees with the
+                    // provider's own geometry.
+                    const qreal pxPerPoint = tileDpi / 72.0;
+                    const int originX = qRound(regionPt.x() * pxPerPoint);
+                    const int originY = qRound(regionPt.y() * pxPerPoint);
                     const QRect tileBounds(QPoint(0, 0), tileImage.size());
                     tileRegions.reserve(pageRegions.size());
                     for (const QRect& region : pageRegions) {
@@ -20220,7 +20423,13 @@ void DocumentViewport::doAsyncPdfTilePreload()
 
         // Background thread: rasterise just this region (thread-safe provider).
         QFuture<QImage> future = QtConcurrent::run(
-            [renderPageNum, tileDpi, pdfPath, regionPt]() -> QImage {
+            [renderPageNum, tileDpi, pdfPath, regionPt, generation, generationToken]() -> QImage {
+                // Bail out before paying for a rasterisation the view no longer
+                // wants. This is the only point where a queued request can be
+                // abandoned for free.
+                if (generation != generationToken->load()) {
+                    return QImage();
+                }
                 ThreadPdfCache& cache = s_threadPdfCache.localData();
                 PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
                 if (!threadPdf || !threadPdf->isValid()) {

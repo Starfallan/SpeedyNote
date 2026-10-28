@@ -38,6 +38,9 @@ enum class TouchGestureMode {
 #include <QStack>
 #include <QMap>
 #include <QSet>
+#include <QHash>
+#include <atomic>
+#include <memory>
 
 class QContextMenuEvent;
 class QMenu;
@@ -3718,14 +3721,23 @@ private:
     mutable QMutex m_pdfCacheMutex;  ///< Mutex for thread-safe cache access
 
     // ===== High-DPI PDF tile cache (above kPdfDpiCap) =====
-    /// Whole-page renders are capped here; past it the viewport tiles instead.
+    /// Clarity threshold: a whole-page render stops being sharp past this DPI,
+    /// so beyond it the viewport tiles the visible region instead.
     static constexpr qreal kPdfDpiCap = 300.0;
+    /// Hysteresis on the way back down, as a fraction of kPdfDpiCap. Entering
+    /// tiled mode at 300 DPI and leaving only below 255 DPI keeps a page that
+    /// sits on the boundary from flipping render modes on every zoom notch.
+    static constexpr qreal kPdfTiledExitDpiFactor = 0.85;
+    static constexpr double kPdfWholePageMaxPixels = 32.0 * 1024.0 * 1024.0;
+    /// Same hysteresis idea for the safety threshold: once tiled, stay tiled
+    /// until a whole page would fit comfortably again. Without it, scrolling a
+    /// document that mixes A4 and A0 pages would flip the regime page by page.
+    static constexpr double kPdfWholePageExitFactor = 0.8;
     /// Ceiling for a single tile's DPI. A tile is viewport-sized, so this only
     /// bounds a pathological zoom, not the page.
-    static constexpr qreal kPdfTileMaxDpi = 1200.0;
-    /// Pixel budget for one tile, mirroring the backend's own raster guard
-    /// (which rejects anything above 64 MP). A tile follows the device pixels of
-    /// the window, so even a 4K window at dpr 2 stays around 10 MP.
+    static constexpr qreal kPdfTileMaxDpi = 1600.0;
+    /// Pixel budget for one tile, well under the backend's 64 MP guard. The
+    /// tile DPI is reduced (never the region rejected) to stay inside it.
     static constexpr double kPdfTileMaxPixels = 48.0 * 1024.0 * 1024.0;
     /// Rough byte budget for the whole tile cache, so a large window cannot pin
     /// a gigabyte with a count-based limit.
@@ -3740,6 +3752,19 @@ private:
     mutable QMutex m_pdfTileCacheMutex;   ///< Guards m_pdfTileCache
     int m_pdfTileCacheCapacity = 6;
     QSet<QString> m_pdfTilesInFlight;     ///< Main-thread only; render dedup keys
+    /// Discards tile work that a newer view state has superseded. Bumped
+    /// whenever the current generation's tiles can no longer be shown; a
+    /// worker checks it before rasterising and the finished handler checks it
+    /// again. Shared because a worker must not touch `this`.
+    std::shared_ptr<std::atomic<quint64>> m_pdfTileGeneration =
+        std::make_shared<std::atomic<quint64>>(0);
+    /// True while the view is in the tiled regime. Recomputed by
+    /// refreshPdfTiledMode() on every zoom / layout / settle change, so the
+    /// paint path can read it without re-deriving page geometry.
+    bool m_pdfTiledActive = false;
+    /// Memoised provider page geometry (PDF points) for the budget estimate.
+    /// Page::size is persisted metadata; the provider is authoritative.
+    mutable QHash<QString, QSizeF> m_pdfPageSizePtCache;
     
     // ===== Async PDF Preloading =====
     QTimer* m_pdfPreloadTimer = nullptr;  ///< Debounce timer for preload requests
@@ -4024,15 +4049,6 @@ private:
      */
     QPixmap lookupCachedPdfPage(const QString& sourceId, int pageIndex, qreal dpi) const;
 
-    /**
-     * @brief Cache-only page lookup that ignores the render DPI.
-     *
-     * Used above kPdfDpiCap as a coarse placeholder: while the sharp tile for
-     * the current zoom is still rendering, the previous page-level render (at
-     * whatever DPI it was made) is drawn stretched instead of leaving the page
-     * blank. Never renders.
-     */
-    QPixmap lookupAnyCachedPdfPage(const QString& sourceId, int pageIndex) const;
     
     /**
      * @brief Request PDF preload (debounced).
@@ -4051,13 +4067,44 @@ private:
     // the visible region is rasterised on demand (see PdfTileEntry). These
     // helpers are the whole of that path.
 
-    /// True while the screen needs more DPI than a whole-page render may use.
+    /// True while PDF pages are rendered as viewport tiles instead of whole
+    /// pages. Latched by refreshPdfTiledMode(): either the screen needs more DPI
+    /// than a whole-page render may use, or a whole page would exceed the raster
+    /// pixel budget. Safe on the paint path (reads one bool).
     bool usesTiledPdfRender() const;
+
+    /**
+     * @brief Recompute whether the view rasterises PDF pages as tiles.
+     *
+     * Two independent thresholds decide this, because they answer different
+     * questions and bite at different page sizes:
+     *  - clarity: a whole-page render is capped at kPdfDpiCap, so beyond that
+     *    DPI the screen would show a stretched bitmap;
+     *  - safety: a whole-page raster above kPdfWholePageMaxPixels is refused by
+     *    the backend, which blanks the page -- and the DPI at which that happens
+     *    scales with the page's physical size, so a fixed DPI cap cannot stand in
+     *    for it (an A0 sheet is already over budget at ~208 DPI).
+     *
+     * Latched rather than derived per paint, so the paint path never touches
+     * page geometry or the provider. Called from every zoom / layout / settle
+     * change (via updatePdfCacheCapacity()) and from setZoomLevel().
+     */
+    void refreshPdfTiledMode();
+
+    /// What a whole-page raster of this page would cost, in pixels.
+    /// Uses the provider's page geometry (authoritative, memoised in
+    /// m_pdfPageSizePtCache) instead of the persisted Page::size metadata.
+    double estimatedWholePagePixels(const Page* page) const;
+
+    /// The provider's page geometry in PDF points, memoised. Empty when the
+    /// source cannot be asked (no provider / no mapping for this page).
+    QSizeF pdfPageSizePt(const Page* page) const;
 
     /// DPI the screen actually needs: 96 * zoom * devicePixelRatio (uncapped).
     qreal requiredPdfDpi() const;
 
-    /// DPI a tile is rendered at, given the current demand.
+    /// DPI a tile is rendered at. One value per view state, not per region, so a
+    /// pan cannot change it and invalidate the cache -- see the definition.
     qreal pdfTileDpi() const;
 
     /**
@@ -4065,8 +4112,7 @@ private:
      * @return Region in page units and PDF points, or an invalid region when the
      *         page is off-screen or the inputs are degenerate.
      */
-    PdfTileGeometry::TileRegion pdfTileRegionForPage(const Page* page, int pageIndex,
-                                                     qreal tileDpi) const;
+    PdfTileGeometry::TileRegion pdfTileRegionForPage(const Page* page, int pageIndex) const;
 
     /// Cache-only lookup: any cached tile for this page that intersects the
     /// visible part of the page. Never renders.
@@ -4088,6 +4134,12 @@ private:
 
     /// True while a tile render with this key is already in flight.
     bool isPdfTileInFlight(const QString& key) const;
+
+    /// Bump the generation, making every outstanding tile request obsolete.
+    void supersedePdfTiles();
+
+    /// Drop the tile cache and supersede outstanding requests (zoom change).
+    void invalidatePdfTileCache();
 
     /**
      * @brief Mark the immediate-pan route as actively scrolling (SP1).

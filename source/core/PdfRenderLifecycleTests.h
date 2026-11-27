@@ -6,6 +6,7 @@
 #include "DocumentViewport.h"
 #include "DarkModeUtils.h"
 #include "../pdf/MuPdfProvider.h"
+#include "../objects/ImageObject.h"
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -233,8 +234,150 @@ class PdfRenderLifecycleTests {
                 "tile completion restricts repaint to its visible region");
         view.m_gesture.activeType = DocumentViewport::ViewportGestureState::Pan;
         view.m_gesture.cachedFrame = QPixmap(8, 8);
-        c.check(view.pdfRepaintRegion(source, 0).isEmpty(), "results do not redraw an unchanged gesture snapshot");
+        c.check(view.pdfRepaintRegion(source, 0) == expected,
+                "pan completion identifies current visible content for snapshot refresh");
+        view.m_gesture.activeType = DocumentViewport::ViewportGestureState::Zoom;
+        c.check(view.pdfRepaintRegion(source, 0).isEmpty(), "zoom still defers snapshot content changes");
         view.m_gesture.reset();
+    }
+
+    static QImage canvasImage(DocumentViewport& view, qreal dpr) {
+        QImage image(QSize(qRound(view.width() * dpr), qRound(view.height() * dpr)), QImage::Format_RGB32);
+        image.setDevicePixelRatio(dpr);
+        QPainter painter(&image);
+        view.renderCanvas(painter, view.rect());
+        return image;
+    }
+
+    static void livePan(const QString& path, Checks& c, bool tiled) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport view;
+        view.setAttribute(Qt::WA_DontShowOnScreen);
+        view.show(); // Exercise the real visible/enabled entry without showing a window.
+        prepare(view, document.get());
+        if (tiled) view.setZoomLevel(4.0);
+        view.m_pdfPreloadTimer->stop();
+        const QString source = document->page(2)->pdfSourceId;
+        // Ink and an inserted object must survive PDF result composition.
+        VectorStroke stroke;
+        stroke.color = Qt::magenta;
+        stroke.baseThickness = 8;
+        stroke.points = {{QPointF(20, 60), 1.0, 0}, {QPointF(120, 60), 1.0, 0}};
+        stroke.updateBoundingBox();
+        document->page(2)->layer(0)->addStroke(stroke);
+        auto object = std::make_unique<ImageObject>();
+        QPixmap swatch(30, 30);
+        swatch.fill(Qt::green);
+        object->setPixmap(swatch);
+        object->position = QPointF(80, 20);
+        document->page(2)->addObject(std::move(object));
+
+        WorkerGate gate;
+        if (!gate.ready()) { c.check(false, "pan worker gate starts"); return; }
+        view.beginPanGesture();
+        c.check(view.m_gesture.activeType == DocumentViewport::ViewportGestureState::Pan,
+                "live pan starts through the real gesture entry");
+        const QPointF target = view.pagePosition(2);
+        for (int i = 0; i < 40; ++i) {
+            view.updatePanGesture(target + QPointF(0, i / view.zoomLevel()) - view.m_gesture.targetPan);
+            view.doAsyncPdfPreload();
+        }
+        view.updatePanGesture(target - view.m_gesture.targetPan);
+        view.m_gestureTimeoutTimer->stop(); // A safety timeout must not masquerade as live progress.
+        c.check(view.m_panOffset == target && view.m_scrollActive
+                && !view.m_scrollSettleTimer->isActive() && !view.m_focusRebuildTimer->isActive()
+                && view.m_activePdfWatchers.size() == 1,
+                "held pan follows target demand with one job and no settle housekeeping");
+        gate.release();
+        c.check(waitUntil([&] {
+            // QWidget::render supplies paints even without a native visible window.
+            if (view.m_gesture.panFrameRefreshDue) view.grabOpaqueViewport();
+            const bool loaded = tiled
+                ? !view.lookupCachedPdfTiles(source, 2, view.pdfTileDpi()).isEmpty()
+                : !view.lookupCachedPdfPage(source, 2, view.effectivePdfDpi()).isNull();
+            return loaded && view.m_activePdfWatchers.isEmpty()
+                && !view.m_pdfPreloadTimer->isActive() && !view.m_panFrameTimer->isActive()
+                && !view.m_gesture.panFrameRefreshDue && !view.m_gesture.panFrameDirty;
+        }), "PDF loads and enters the held snapshot without release or further movement");
+        c.check(view.m_gesture.activeType == DocumentViewport::ViewportGestureState::Pan,
+                "progress did not end the gesture");
+        const QPointF actualPan = view.m_panOffset;
+        view.m_panOffset = view.m_gesture.startPan;
+        const QImage expected = canvasImage(view, view.m_gesture.frameDevicePixelRatio);
+        view.m_panOffset = actualPan;
+        c.check(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32) == expected,
+                "held snapshot matches normal PDF, ink and object composition");
+
+        // Refresh-only invalidation works while the finger remains stationary.
+        view.setDarkMode(true);
+        c.check(view.m_panFrameTimer->isActive() && view.m_gesture.panFrameDirty,
+                "stationary theme change schedules a snapshot refresh");
+        view.endPanGesture();
+        c.check(!view.m_panFrameTimer->isActive() && !view.m_gesture.panFrameRefreshDue,
+                "release retires pending snapshot refresh");
+        view.beginPanGesture();
+        view.updatePanGesture(QPointF(0, 1));
+        view.hide();
+        c.check(!view.m_panFrameTimer->isActive() && !view.m_gesture.isActive(),
+                "hiding cancels a queued pan snapshot update");
+        view.show();
+        view.beginPanGesture();
+        view.updatePanGesture(QPointF(0, 1));
+        view.setDocument(nullptr);
+        c.check(!view.m_panFrameTimer->isActive() && !view.m_gesture.isActive(),
+                "document switch cancels a queued pan snapshot update");
+    }
+
+    static void panPixelAlignment(const QString& path, Checks& c) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport view;
+        prepare(view, document.get());
+        // Cache-independent, high-contrast content detects stale exposed pixels.
+        for (int i = 0; i < document->pageCount(); ++i) {
+            document->page(i)->backgroundType = Page::BackgroundType::Grid;
+            document->page(i)->gridSpacing = 19;
+            for (int version : {0, 1}) {
+                auto text = std::make_unique<TextBoxObject>();
+                text->text = QStringLiteral("**Pan clip:** overlapping translucent text");
+                text->textLayoutVersion = version;
+                text->fontSize = 16;
+                text->position = QPointF(35, 45 + version * 90);
+                text->size = QSizeF(250, 80);
+                text->fontColor = QColor(30, 50, 150, 120);
+                text->backgroundColor = QColor(180, 210, 240, 100);
+                document->page(i)->addObject(std::move(text));
+            }
+        }
+        for (qreal dpr : {1.0, 1.25, 1.5, 2.0}) {
+            const QPointF origin(10, 10);
+            view.m_panOffset = origin;
+            view.m_gesture.activeType = DocumentViewport::ViewportGestureState::Pan;
+            view.m_gesture.startZoom = view.zoomLevel();
+            view.m_gesture.startPan = view.m_gesture.targetPan = origin;
+            view.m_gesture.panFrameOrigin = origin;
+            view.m_gesture.panFramePixelOffset = QPoint();
+            view.m_gesture.frameDevicePixelRatio = dpr;
+            view.m_gesture.cachedFrame = QPixmap::fromImage(canvasImage(view, dpr));
+            bool aligned = true;
+            // Multiple viewport lengths, both directions, and subpixel steps.
+            for (int step = 0; step < 80; ++step) {
+                const qreal travel = (step < 40 ? step : 79 - step) * 13.37;
+                const QPointF target = origin + QPointF(travel * .41, travel);
+                view.updatePanGesture(target - view.m_gesture.targetPan);
+                view.m_panFrameTimer->stop();
+                view.refreshPanFrame();
+                const QPointF residual = (target - view.m_gesture.startPan) * (view.zoomLevel() * dpr);
+                aligned &= qAbs(residual.x()) <= .500001 && qAbs(residual.y()) <= .500001;
+            }
+            c.check(aligned && QLineF(view.m_gesture.startPan, origin).length() < .000001,
+                    "fractional-DPR round trip preserves origin and bounds subpixel residual");
+            c.check(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32)
+                    == canvasImage(view, dpr), "scrolled strips match a fresh canvas after a round trip");
+            view.resetViewportGesture();
+        }
+        view.setDocument(nullptr);
     }
 
     static void latestDemand(const QString& path, Checks& c, bool tiled) {
@@ -540,6 +683,9 @@ public:
         invalidation(pdfPath, c, true);
         documentSwitchAndShutdown(pdfPath, c);
         repaint(pdfPath, c);
+        livePan(pdfPath, c, false);
+        livePan(pdfPath, c, true);
+        panPixelAlignment(pdfPath, c);
         latestDemand(pdfPath, c, false);
         latestDemand(pdfPath, c, true);
         cacheRetention(pdfPath, c, false);

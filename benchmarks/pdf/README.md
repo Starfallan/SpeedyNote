@@ -153,6 +153,29 @@ node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchma
 
 ## 比较候选改动
 
+第四步处理持续按住手指或手形拖动：加载位置随手势移动，合并更新截图的新露出区域和新完成内容，仍保留即时截图平移。没有提高 PDF 并发、缓存预算或降低最终 DPI。复杂冷页仍可能暂时空白；本步没有新增低清预览。普通拖动和快速翻动应分别衡量。
+
+手势截图覆盖探针已更新，**不能直接用旧 step3 报告做正式比较**。Actions 的 `pdf_benchmark=true` 加 `pdf_pan_reference=true` 会在同一次构建中提供 `speedynote.exe` 候选和 `speedynote-step3.exe` 对照，使用相同新版探针及 DLL。`step3-reference-build.json` 记录对照来源；对照为 `3705003` 应用源码，只有测量代码采用新版。对照编译失败时保留候选包并生成 `step3-reference-error.txt`，不执行 PDF 功能测试。该构建选项仅适用于本步；脚本发现后续应用变化超出恢复范围会拒绝生成错误的对照。
+
+从便携包根目录执行，沿用原 suite 即可对原有十个场景交替 A/B：
+
+```powershell
+./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory .
+node benchmarks/pdf/bench.mjs run --exe ./speedynote-step3.exe --against ./speedynote.exe --suite out/pdf-benchmark/corpus-real/suite.json --out out/pdf-benchmark/step4-paired --repeat 5
+node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/step4-paired --candidate out/pdf-benchmark/step4-paired --out out/pdf-benchmark/step4-comparison.json
+```
+
+针对真实触摸路径，无需重新生成 PDF；从原 suite 派生手势场景：
+
+```powershell
+node benchmarks/pdf/pan-suite.mjs out/pdf-benchmark/corpus-real/suite.json out/pdf-benchmark/pan-suite.json
+node benchmarks/pdf/bench.mjs run --exe ./speedynote-step3.exe --against ./speedynote.exe --suite out/pdf-benchmark/pan-suite.json --out out/pdf-benchmark/step4-hand-read --case real-hand-read --repeat 5
+```
+
+`real-hand-read` 为 400% 缩放下用六秒移动两个视口高度并返回；`real-hand-scroll` 使用普通缩放的相同阅读速度，覆盖跨页；`real-hand-fast` 沿用原 `hand` 的三秒移动本页可移动高度 85% 并返回。三者全程使用 begin/update/endPanGesture。输出目录必须不同；供电、窗口、DPR 和后台负载尽量固定。首次可用 `--repeat 1` 检查，正式比较再交替重复。手势场景以外的十个场景也需要复测，避免只观察空白改善而遗漏 CPU、内存或事件循环长尾变化。
+
+第四步手动功能检查覆盖：按住期间整页和区域完成后进入截图、无新增输入时显示、笔迹与图片层次、主题/隐藏/文档切换、DPR 1/1.25/1.5/2 的往返偏移及透明文本重复绘制。合成发生在 paint 计时内，不能用低 paint 数字隐藏 timer 中的绘制成本；它仍不是物理笔到屏幕延迟测试。
+
 第二步候选提供滚动中的可见需求调度和任务上限，普通整页 miss 不再同步渲染。其测试标签可用 `--label step2`。原生探针和 runner 未修改，可与已有 baseline / step1 对比；先使用 `--case text-scroll --repeat 1` 检查滚动过程中是否出现内容，再测 `real-scroll` / `real-pan`。单视口的 `sampled_max_pending` 应不超过 1，但这是采样值，完整并发约束由手动功能测试检查。手形截图路径未在第二步修改，不能期待 `vector-hand` 的新区域空白因此消失。
 
 第三步候选复用最多两个 worker provider；每个 provider 仅保留一个热点页 display list，构建期间 MuPDF context 分配限额为 32 MiB。深色图片区域提取和像素转换在 worker 完成，离屏但仍有效的已完成图像可以进入现有缓存供回看使用。并发、光栅和图片缓存预算不增加；32 MiB 不代表整个 provider 或进程内存上限。首次构建有成本，复杂页超额会退回直接渲染，需同时比较首屏、空白、CPU 和峰值内存。手形截图的新区域仍不在此步范围内。

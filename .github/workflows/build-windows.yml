@@ -10,9 +10,14 @@ on:
         description: Build portable PDF benchmark packages (measure on your own desktop)
         type: boolean
         default: false
+      pdf_pan_reference:
+        description: Also package Step3 with the current probe for manual pan A/B (requires pdf_benchmark)
+        type: boolean
+        default: false
 
 env:
   PDF_BENCHMARK: ${{ github.event_name == 'workflow_dispatch' && inputs.pdf_benchmark && 'ON' || 'OFF' }}
+  PDF_PAN_REFERENCE: ${{ inputs.pdf_benchmark && inputs.pdf_pan_reference && 'ON' || 'OFF' }}
 
 # Required for release uploads
 permissions:
@@ -232,6 +237,18 @@ jobs:
           Write-Host "::endgroup::"
           
           if ($env:PDF_BENCHMARK -eq 'ON') {
+            if ($env:PDF_PAN_REFERENCE -eq 'ON') {
+              $candidateBeforeReference = (Get-FileHash -LiteralPath 'speedynote.exe' -Algorithm SHA256).Hash
+              try {
+                & ../benchmarks/pdf/build-pan-reference.ps1 -BuildDirectory .
+              } catch {
+                Write-Warning "Optional Step3 reference failed; retaining candidate package: $_"
+                $_ | Out-String | Set-Content -LiteralPath 'step3-reference-error.txt' -Encoding utf8
+              }
+              if ((Get-FileHash -LiteralPath 'speedynote.exe' -Algorithm SHA256).Hash -ne $candidateBeforeReference) {
+                throw 'Candidate executable was not restored after reference build.'
+              }
+            }
             & ../benchmarks/pdf/package.ps1 -BuildDirectory . -MsysRoot "$env:RUNNER_TEMP\msys64"
           }
 
@@ -541,6 +558,18 @@ jobs:
           Write-Host "::endgroup::"
 
           if ($env:PDF_BENCHMARK -eq 'ON') {
+            if ($env:PDF_PAN_REFERENCE -eq 'ON') {
+              $candidateBeforeReference = (Get-FileHash -LiteralPath 'speedynote.exe' -Algorithm SHA256).Hash
+              try {
+                & ../benchmarks/pdf/build-pan-reference.ps1 -BuildDirectory .
+              } catch {
+                Write-Warning "Optional Step3 reference failed; retaining candidate package: $_"
+                $_ | Out-String | Set-Content -LiteralPath 'step3-reference-error.txt' -Encoding utf8
+              }
+              if ((Get-FileHash -LiteralPath 'speedynote.exe' -Algorithm SHA256).Hash -ne $candidateBeforeReference) {
+                throw 'Candidate executable was not restored after reference build.'
+              }
+            }
             & ../benchmarks/pdf/package.ps1 -BuildDirectory . -MsysRoot "$env:RUNNER_TEMP\msys64"
           }
 

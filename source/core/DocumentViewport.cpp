@@ -324,6 +324,14 @@ DocumentViewport::DocumentViewport(QWidget* parent)
     m_gestureTimeoutTimer = new QTimer(this);
     m_gestureTimeoutTimer->setSingleShot(true);
     connect(m_gestureTimeoutTimer, &QTimer::timeout, this, &DocumentViewport::onGestureTimeout);
+    m_panFrameTimer = new QTimer(this);
+    m_panFrameTimer->setSingleShot(true);
+    m_panFrameTimer->setInterval(33);
+    connect(m_panFrameTimer, &QTimer::timeout, this, [this]() {
+        if (m_gesture.activeType != ViewportGestureState::Pan) return;
+        m_gesture.panFrameRefreshDue = true;
+        update();
+    });
     
     // Touch gesture handler (encapsulates pan/zoom/tap logic)
     m_touchHandler = new TouchGestureHandler(this, this);
@@ -343,6 +351,7 @@ DocumentViewport::DocumentViewport(QWidget* parent)
     m_focusRebuildTimer = new QTimer(this);
     m_focusRebuildTimer->setSingleShot(true);
     connect(m_focusRebuildTimer, &QTimer::timeout, this, [this]() {
+        if (m_gesture.activeType == ViewportGestureState::Pan) return;
         m_focusCacheSuspended = false;
         update();
     });
@@ -415,7 +424,7 @@ DocumentViewport::~DocumentViewport()
     cancelAndWaitForBackgroundThreads();
     
     // Clear gesture cached frame (releases memory)
-    m_gesture.reset();
+    resetViewportGesture();
     
     // ========== MEMORY FIX: Explicit cache cleanup ==========
     // While these should be cleaned up automatically by member destructors,
@@ -480,9 +489,10 @@ void DocumentViewport::setDocument(Document* doc)
     
     // End any active gesture (cached frame is from old document)
     if (m_gesture.isActive()) {
-        m_gesture.reset();
+        resetViewportGesture();
         m_gestureTimeoutTimer->stop();
     }
+    if (m_touchHandler) m_touchHandler->reset();
     m_backtickHeld = false;  // Reset key tracking for new document
     
     // An eraser gesture refers to the outgoing document and the undo stacks
@@ -694,6 +704,7 @@ void DocumentViewport::setDarkMode(bool dark)
     // Dark mode: dark gray, Light mode: light gray
     // Unified gray colors: dark #4d4d4d (secondary), light #D0D0D0 (secondary)
     m_backgroundColor = dark ? QColor(0x4d, 0x4d, 0x4d) : QColor(0xD0, 0xD0, 0xD0);
+    schedulePanFrameRefresh(true);
     
     // Update palette for auto-fill background
     QPalette pal = palette();
@@ -1450,6 +1461,10 @@ void DocumentViewport::noteSystemClipboardChanged()
 
 void DocumentViewport::setZoomLevel(qreal zoom)
 {
+    if (m_gesture.activeType == ViewportGestureState::Pan) {
+        if (m_touchHandler) m_touchHandler->reset();
+        endPanGesture();
+    }
     // Apply mode-specific minimum zoom
     qreal minZ = (m_document && m_document->isEdgeless()) 
                  ? minZoomForEdgeless() 
@@ -1515,6 +1530,10 @@ void DocumentViewport::setZoomLevel(qreal zoom)
 
 void DocumentViewport::setPanOffset(QPointF offset, bool steppedScroll)
 {
+    if (m_gesture.activeType == ViewportGestureState::Pan) {
+        if (m_touchHandler) m_touchHandler->reset();
+        endPanGesture();
+    }
     // Pan in flight: suspend the focus cache (see setZoomLevel for rationale).
     if (m_focusRebuildTimer) {
         m_focusCacheSuspended = true;
@@ -1555,6 +1574,7 @@ void DocumentViewport::onScrollActivity(bool steppedScroll)
 
 void DocumentViewport::onScrollSettled()
 {
+    if (m_gesture.activeType == ViewportGestureState::Pan) return;
     m_scrollActive = false;
     if (!m_document) {
         return;
@@ -3305,6 +3325,9 @@ void DocumentViewport::paintEvent(QPaintEvent* event)
     ViewportPerfMonitor::FrameSampler perfSample(m_perf, event->rect(), size(),
                                                  devicePixelRatioF());
     
+    // Refresh before opening the widget painter. This work remains inside the
+    // paint sampler and is shared with the benchmark's measured paint time.
+    if (m_gesture.panFrameRefreshDue) refreshPanFrame();
     QPainter painter(this);
     // Note: Antialiasing is deferred until after gesture fast paths.
     // Gesture paths only blit cached pixmaps and don't need it.
@@ -3435,13 +3458,17 @@ void DocumentViewport::paintEvent(QPaintEvent* event)
         return;
     }
     
+    renderCanvas(painter, event->rect());
+}
+
+void DocumentViewport::renderCanvas(QPainter& painter, const QRect& dirtyRect)
+{
     // Enable antialiasing for normal (non-gesture) rendering.
     // Deferred to here so gesture fast paths above skip the overhead.
     painter.setRenderHint(QPainter::Antialiasing, true);
     
     // ========== OPTIMIZATION: Dirty Region Rendering ==========
     // Only repaint what's needed. During stroke drawing, the dirty region is small.
-    QRect dirtyRect = event->rect();
     bool isPartialUpdate = (dirtyRect.width() < width() / 2 || dirtyRect.height() < height() / 2);
     
     // Fill background - only the dirty region for partial updates
@@ -4635,7 +4662,7 @@ void DocumentViewport::hideEvent(QHideEvent* event)
     // When user goes to launcher and comes back, any stale gesture state
     // would block new gestures (beginZoomGesture returns early if isActive())
     if (m_gesture.isActive()) {
-        m_gesture.reset();
+        resetViewportGesture();
         m_gestureTimeoutTimer->stop();
     }
     
@@ -4715,7 +4742,7 @@ void DocumentViewport::onApplicationStateChanged(Qt::ApplicationState state)
             m_touchHandler->reset();
         }
         if (m_gesture.isActive()) {
-            m_gesture.reset();
+            resetViewportGesture();
             m_gestureTimeoutTimer->stop();
         }
         
@@ -5196,7 +5223,7 @@ void DocumentViewport::endZoomGesture()
     QPointF newPan = zoomCorrectedPan + centroidPanDelta;
     
     // Clear gesture state BEFORE applying zoom (to avoid recursion in paintEvent)
-    m_gesture.reset();
+    resetViewportGesture();
     
     // Apply final zoom and pan
     m_zoomLevel = finalZoom;
@@ -5251,11 +5278,21 @@ void DocumentViewport::beginPanGesture()
     m_gesture.targetZoom = m_zoomLevel;
     m_gesture.startPan = m_panOffset;
     m_gesture.targetPan = m_panOffset;
+    m_gesture.panFrameOrigin = m_panOffset;
+    m_gesture.panFramePixelOffset = QPoint();
     
     // Capture current viewport as cached frame for fast shifting
     m_gesture.cachedFrame = grabOpaqueViewport();
     // Store device pixel ratio for correct positioning on high-DPI displays
     m_gesture.frameDevicePixelRatio = m_gesture.cachedFrame.devicePixelRatio();
+
+    if (m_document && !m_document->isEdgeless()) {
+        m_scrollActive = true;
+        m_scrollSettleTimer->stop();
+        m_focusCacheSuspended = true;
+        m_focusRebuildTimer->stop();
+        preloadPdfCache();
+    }
     
     // Grab keyboard focus to receive keyReleaseEvent when modifier is released
     setFocus(Qt::OtherFocusReason);
@@ -5270,9 +5307,18 @@ void DocumentViewport::updatePanGesture(QPointF panDelta)
     if (!m_gesture.isActive()) {
         beginPanGesture();
     }
+    if (m_gesture.activeType != ViewportGestureState::Pan) return;
     
     // Accumulate pan offset (additive)
     m_gesture.targetPan += panDelta;
+
+    if (m_document && !m_document->isEdgeless()) {
+        m_panOffset = m_gesture.targetPan;
+        m_failedPdfRequests.clear();
+        discardOffscreenPdfRequest();
+        preloadPdfCache();
+        schedulePanFrameRefresh();
+    }
     
     // Note: We don't clamp targetPan here - let endPanGesture handle clamping
     // This allows the visual feedback to show unclamped pan during the gesture
@@ -5284,6 +5330,82 @@ void DocumentViewport::updatePanGesture(QPointF panDelta)
     update();
 }
 
+void DocumentViewport::resetViewportGesture()
+{
+    m_panFrameTimer->stop();
+    if (m_gesture.activeType == ViewportGestureState::Pan) {
+        m_scrollActive = false;
+        m_focusCacheSuspended = false;
+    }
+    m_gesture.reset();
+}
+
+void DocumentViewport::schedulePanFrameRefresh(bool contentChanged)
+{
+    if (m_gesture.activeType != ViewportGestureState::Pan
+        || !m_document || m_document->isEdgeless()) return;
+    m_gesture.panFrameDirty |= contentChanged;
+    if (!m_gesture.panFrameRefreshDue && !m_panFrameTimer->isActive())
+        m_panFrameTimer->start();
+}
+
+void DocumentViewport::refreshPanFrame()
+{
+    m_gesture.panFrameRefreshDue = false;
+    if (m_gesture.activeType != ViewportGestureState::Pan
+        || m_gesture.cachedFrame.isNull() || !m_document || m_document->isEdgeless()) return;
+
+    const qreal dpr = m_gesture.frameDevicePixelRatio;
+    const qreal scale = m_gesture.startZoom * dpr;
+    if (!(scale > 0)) return;
+    const QPointF movement = (m_gesture.panFrameOrigin - m_gesture.targetPan) * scale;
+    const QPoint pixelOffset(qRound(movement.x()), qRound(movement.y()));
+    const QPoint shift = pixelOffset - m_gesture.panFramePixelOffset;
+    const QRect frameRect = m_gesture.cachedFrame.rect();
+    QRegion exposed;
+    // scroll operates on physical pixels, and must precede the QPainter.
+    if (!shift.isNull())
+        m_gesture.cachedFrame.scroll(shift.x(), shift.y(), frameRect, &exposed);
+    if (m_gesture.panFrameDirty) exposed = QRegion(frameRect);
+    m_gesture.panFrameDirty = false;
+    if (exposed.isEmpty()) return;
+
+    m_gesture.panFramePixelOffset = pixelOffset;
+    m_gesture.startPan = m_gesture.panFrameOrigin - QPointF(pixelOffset) / scale;
+    const QPointF targetPan = m_panOffset;
+    m_panOffset = m_gesture.startPan;
+
+    // Expand each physical strip to logical pixels. Slight overlap is painted
+    // once with the full layer stack; it cannot leave a fractional-DPR seam.
+    QRegion dirty;
+    for (const QRect& part : exposed) {
+        dirty += QRectF(part.x() / dpr, part.y() / dpr,
+                        part.width() / dpr, part.height() / dpr).toAlignedRect();
+    }
+    dirty &= rect();
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    if (m_pdfBenchmarkSink) m_pdfBenchmarkSink->panFrameBegin(shift, dirty, dpr);
+#endif
+    {
+        QPainter framePainter(&m_gesture.cachedFrame);
+        framePainter.setClipRegion(dirty);
+        renderCanvas(framePainter, dirty.boundingRect());
+    }
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    if (m_pdfBenchmarkSink) m_pdfBenchmarkSink->panFrameEnd();
+#endif
+    m_panOffset = targetPan;
+}
+
+void DocumentViewport::repaintPdfRegion(const QRegion& dirty)
+{
+    if (dirty.isEmpty()) return;
+    if (m_gesture.activeType == ViewportGestureState::Pan)
+        schedulePanFrameRefresh(true);
+    else
+        update(dirty);
+}
+
 void DocumentViewport::endPanGesture()
 {
     if (m_gesture.activeType != ViewportGestureState::Pan) {
@@ -5292,15 +5414,21 @@ void DocumentViewport::endPanGesture()
     
     // Stop timeout timer
     m_gestureTimeoutTimer->stop();
+    m_panFrameTimer->stop();
     
     // Get final pan offset
     QPointF finalPan = m_gesture.targetPan;
     
     // Clear gesture state BEFORE applying pan (to avoid recursion in paintEvent)
-    m_gesture.reset();
+    resetViewportGesture();
     
     // Apply final pan
     m_panOffset = finalPan;
+    if (m_document && !m_document->isEdgeless()) {
+        m_focusCacheSuspended = true;
+        m_focusRebuildTimer->start(150);
+        onScrollActivity();
+    }
     
     // Clamp and emit signals
     clampPanOffset();
@@ -5483,6 +5611,13 @@ bool DocumentViewport::event(QEvent* event)
             return QWidget::event(event);
         }
         
+        // A pen/mouse contact owns the canvas until release. Do not restart
+        // touch pan underneath a stroke after the pen committed its position.
+        if (m_pointerActive) {
+            if (m_touchHandler) m_touchHandler->reset();
+            event->accept();
+            return true;
+        }
         if (m_touchHandler && m_touchHandler->handleTouchEvent(touchEvent)) {
             return true;
         }
@@ -5641,7 +5776,8 @@ QRegion DocumentViewport::pdfRepaintRegion(const QString& sourceId, int pageInde
 {
     QRegion dirty;
     if (!m_document || m_document->isEdgeless()
-        || (m_gesture.isActive() && !m_gesture.cachedFrame.isNull())) {
+        || (m_gesture.isActive() && m_gesture.activeType != ViewportGestureState::Pan
+            && !m_gesture.cachedFrame.isNull())) {
         return dirty;
     }
     // visiblePages() uses the existing layout index. Repeated source pages can
@@ -5725,7 +5861,8 @@ int DocumentViewport::pdfTileCacheEvictionIndex() const
 void DocumentViewport::doAsyncPdfPreload()
 {
     m_pdfPreloadTimer->stop();
-    if (!m_document || m_document->isEdgeless() || m_gesture.isActive()) {
+    if (!m_document || m_document->isEdgeless()
+        || (m_gesture.isActive() && m_gesture.activeType != ViewportGestureState::Pan)) {
         withdrawPdfRenderDemand();
         return;
     }
@@ -5940,7 +6077,7 @@ void DocumentViewport::doAsyncPdfPreload()
             // Off-screen preloads do not alter the current frame. Qt coalesces
             // visible page regions from multiple callbacks into one update.
             const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum);
-            if (!dirty.isEmpty()) update(dirty);
+            repaintPdfRegion(dirty);
         });
         
         // Background thread: render PDF to QImage (thread-safe)
@@ -6025,6 +6162,7 @@ void DocumentViewport::invalidatePdfCache()
 
 void DocumentViewport::invalidatePdfTileCache()
 {
+    schedulePanFrameRefresh(true);
     for (auto it = m_failedPdfRequests.begin(); it != m_failedPdfRequests.end();) {
         if (it->startsWith(QLatin1String("tile|"))) it = m_failedPdfRequests.erase(it);
         else ++it;
@@ -6046,6 +6184,7 @@ void DocumentViewport::invalidatePdfTileCache()
 
 void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageIndex)
 {
+    schedulePanFrameRefresh(true);
     m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     // Match the single-page tile invalidation rule: queued old content must
@@ -6064,6 +6203,7 @@ void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageI
 
 void DocumentViewport::invalidatePdfTileCachePage(const QString& sourceId, int pageIndex)
 {
+    schedulePanFrameRefresh(true);
     m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     // Supersede first: a request for this page that is already rasterising would
@@ -6510,6 +6650,10 @@ void DocumentViewport::releaseFocusCachesBelowThreshold()
 
 PointerEvent DocumentViewport::mouseToPointerEvent(QMouseEvent* event, PointerEvent::Type type)
 {
+    if (type == PointerEvent::Press && m_gesture.activeType == ViewportGestureState::Pan) {
+        if (m_touchHandler) m_touchHandler->reset();
+        endPanGesture();
+    }
     PointerEvent pe;
     pe.type = type;
     pe.source = PointerEvent::Mouse;
@@ -6535,6 +6679,12 @@ PointerEvent DocumentViewport::mouseToPointerEvent(QMouseEvent* event, PointerEv
 
 PointerEvent DocumentViewport::tabletToPointerEvent(QTabletEvent* event, PointerEvent::Type type)
 {
+    // Commit the displayed pan before hit testing the first ink point. A PDF
+    // completion must never refresh a frozen gesture over a new pen stroke.
+    if (type == PointerEvent::Press && m_gesture.activeType == ViewportGestureState::Pan) {
+        if (m_touchHandler) m_touchHandler->reset();
+        endPanGesture();
+    }
     PointerEvent pe;
     pe.type = type;
     pe.source = PointerEvent::Stylus;
@@ -20924,6 +21074,8 @@ void DocumentViewport::renderPage(QPainter& painter, Page* page, int pageIndex)
     QRectF focusRect;
     const VectorLayer::RenderTier tier =
         chooseRenderTier(pageSize, tileLocalVp, &focusRect);
+    if (tier == VectorLayer::RenderTier::Direct && painter.hasClipping())
+        focusRect = focusRect.intersected(painter.clipBoundingRect());
 
     for (int layerIdx = 0; layerIdx < page->layerCount(); ++layerIdx) {
         VectorLayer* layer = page->layer(layerIdx);
@@ -21750,7 +21902,8 @@ void DocumentViewport::prunePdfTiles()
 
 void DocumentViewport::doAsyncPdfTilePreload()
 {
-    if (!m_document || m_document->isEdgeless() || m_gesture.isActive()) {
+    if (!m_document || m_document->isEdgeless()
+        || (m_gesture.isActive() && m_gesture.activeType != ViewportGestureState::Pan)) {
         withdrawPdfRenderDemand();
         return;
     }
@@ -21906,7 +22059,7 @@ void DocumentViewport::doAsyncPdfTilePreload()
             insertPdfTile(entry);
 
             const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum, regionUnits);
-            if (!dirty.isEmpty()) update(dirty);
+            repaintPdfRegion(dirty);
         });
 
         // Background thread: rasterise just this region (thread-safe provider).

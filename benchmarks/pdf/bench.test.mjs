@@ -150,6 +150,19 @@ test('CLI generates corpus, preserves real input, refuses overwrite, records fai
       checkPdf(bytes, doc.pages, doc.kind);
     }
     assert.equal(hash(fs.readFileSync(real)), hash(original));
+    const panSuite = path.join(directory, 'pan-suite.json');
+    const panCli = fileURLToPath(new URL('./pan-suite.mjs', import.meta.url));
+    const panArgs = [panCli, path.join(corpus, 'suite.json'), panSuite];
+    child = spawnSync(process.execPath, panArgs, { encoding: 'utf8', timeout: 30000 });
+    assert.equal(child.status, 0, child.stderr);
+    const pan = JSON.parse(fs.readFileSync(panSuite));
+    assert.equal(pan.cases.length, manifest.documents.length * 3);
+    assert.ok(pan.cases.some(c => c.id === 'real-hand-read' && c.scenario === 'hand-read'));
+    assert.ok(pan.cases.some(c => c.id === 'real-hand-scroll' && c.scenario === 'hand-scroll'));
+    for (const doc of pan.documents)
+      assert.equal(hash(fs.readFileSync(path.resolve(path.dirname(panSuite), doc.path))), doc.sha256);
+    assert.notEqual(spawnSync(process.execPath, panArgs, { encoding: 'utf8' }).status, 0);
+    assert.equal(fs.readFileSync(path.join(corpus, 'suite.json'), 'utf8'), JSON.stringify(manifest, null, 2) + '\n');
     assert.notEqual(call(['generate', '--out', corpus]).status, 0);
     assert.notEqual(call(['generate', '--ot', corpus]).status, 0);
     const output = path.join(directory, 'runs');

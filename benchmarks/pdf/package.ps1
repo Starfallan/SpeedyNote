@@ -28,6 +28,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot record source state.' }
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $benchmarkBuild 'benchmark-build.json') -Encoding utf8
 $destination = Join-Path $benchmarkBuild 'benchmarks/pdf'
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
-foreach ($name in @('bench.mjs', 'bench.test.mjs', 'README.md', 'check-render-lifecycle.ps1')) {
+foreach ($name in @('bench.mjs', 'bench.test.mjs', 'pan-suite.mjs', 'README.md', 'check-render-lifecycle.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $destination -Force
 }

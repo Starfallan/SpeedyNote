@@ -58,6 +58,8 @@ runner 显式使用 `windowsHide: false`。Node 的 `spawnSync` 将 `windowsHide
 
 ## Related records
 
+- [按住平移实时内容](../bug-fix/2026-11-27-pdf-pan-live-content.md)：新探针跟踪截图增量覆盖，新增正常阅读手势；提供同探针 Step3 对照，禁止与旧探针报告直接正式比较。
+
 本次检索 proposed、implemented、rejected 中的 PDF/benchmark 记录：
 
 - [性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)：部分重叠；测量基础设施由本篇承接，优化仍为 proposed。

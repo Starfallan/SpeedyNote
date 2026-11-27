@@ -18,6 +18,7 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
+#include <QTransform>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -100,6 +101,9 @@ public:
     bool recording = false, capturing = false, sawHidden = false, measureCoverage = true;
     bool traceOverflow = false;
     QRegion content, sharp, snapshotContent, snapshotSharp, drawn, drawnSharp;
+    QRegion frameDirty, frameDrawn, frameSharp;
+    bool updatingFrame = false;
+    qreal frameDpr = 1;
     QPointF lastPan;
     qreal lastZoom = 0;
     double lastFrameAt = -1, firstContentAt = -1, firstReadableAt = -1, firstSharpAt = -1;
@@ -113,7 +117,7 @@ public:
     double now() const { return clock.nsecsElapsed() / 1e6; }
     QPointF position() const { return m_panOffset; }
     bool idle() const {
-        return m_activePdfWatchers.isEmpty()
+        return !isMeasuredPanActive() && m_activePdfWatchers.isEmpty()
             && !m_pdfPreloadTimer->isActive() && !m_scrollSettleTimer->isActive()
             && !m_focusRebuildTimer->isActive();
     }
@@ -122,8 +126,10 @@ public:
         capturing = true;
         beginPanGesture();
         capturing = false;
-        snapshotContent = content;
-        snapshotSharp = sharp;
+        frameDpr = m_gesture.frameDevicePixelRatio;
+        const QTransform physical = QTransform::fromScale(frameDpr, frameDpr);
+        snapshotContent = physical.map(content);
+        snapshotSharp = physical.map(sharp);
     }
     void panTo(const QPointF& pos) { updatePanGesture(pos - m_gesture.targetPan); }
     void endMeasuredPan() { endPanGesture(); }
@@ -141,10 +147,34 @@ public:
     }
     void pdfDraw(const QRectF& rect, qreal dpi) override {
         if (!recording || !measureCoverage) return;
+        if (updatingFrame) {
+            const QTransform physical = QTransform::fromScale(frameDpr, frameDpr);
+            const QRegion r(physical.mapRect(rect).toAlignedRect());
+            frameDrawn += r;
+            if (dpi >= requiredPdfDpi() * 0.99) frameSharp += r;
+            return;
+        }
         const QRegion r(rect.toAlignedRect().intersected(this->rect()));
         drawn += r;
         // Target is screen demand, never silently reduced to the cache's DPI.
         if (dpi >= requiredPdfDpi() * 0.99) drawnSharp += r;
+    }
+    void panFrameBegin(const QPoint& shift, const QRegion& dirty, qreal dpr) override {
+        if (!recording || !measureCoverage) return;
+        updatingFrame = true;
+        frameDpr = dpr;
+        const QTransform physical = QTransform::fromScale(dpr, dpr);
+        const QRegion bounds(m_gesture.cachedFrame.rect());
+        snapshotContent = snapshotContent.translated(shift) & bounds;
+        snapshotSharp = snapshotSharp.translated(shift) & bounds;
+        frameDirty = physical.map(dirty) & bounds;
+        frameDrawn = frameSharp = QRegion();
+    }
+    void panFrameEnd() override {
+        if (!updatingFrame) return;
+        snapshotContent = (snapshotContent - frameDirty) + (frameDrawn & frameDirty);
+        snapshotSharp = (snapshotSharp - frameDirty) + (frameSharp & frameDirty);
+        updatingFrame = false;
     }
     QRegion visiblePdfArea(const QPointF& pan, qreal zoom) {
         QRegion result;
@@ -182,8 +212,10 @@ protected:
         if (measureCoverage) {
             if (gesture) {
                 const QPointF delta = (m_gesture.targetPan - m_gesture.startPan) * -m_gesture.startZoom;
-                content = snapshotContent.translated(qRound(delta.x()), qRound(delta.y()));
-                sharp = snapshotSharp.translated(qRound(delta.x()), qRound(delta.y()));
+                const QTransform logical = QTransform::fromScale(1 / frameDpr, 1 / frameDpr);
+                const QPoint shift(qRound(delta.x() * frameDpr), qRound(delta.y() * frameDpr));
+                content = logical.map(snapshotContent.translated(shift));
+                sharp = logical.map(snapshotSharp.translated(shift));
             } else {
                 if (pan != lastPan || !qFuzzyCompare(lastZoom, m_zoomLevel)) {
                     content = QRegion();
@@ -223,9 +255,12 @@ int run(QApplication& app) {
     const QString scenario = value("--benchmark-scenario", "scroll");
     const bool dark = args.contains("--benchmark-dark");
     const bool coverage = !args.contains("--benchmark-no-coverage");
-    const bool high = scenario == "pan" || scenario == "hand";
+    const bool hand = scenario == "hand" || scenario == "hand-read" || scenario == "hand-scroll";
+    const bool reading = scenario == "hand-read" || scenario == "hand-scroll";
+    const double travelMs = reading ? 6000 : 3000;
+    const bool high = scenario == "pan" || scenario == "hand" || scenario == "hand-read";
     if (output.isEmpty() || QFileInfo::exists(output) || !QFileInfo(input).isFile()
-        || !QStringList{"scroll", "pan", "hand", "jump"}.contains(scenario)) {
+        || !QStringList{"scroll", "pan", "hand", "jump", "hand-read", "hand-scroll"}.contains(scenario)) {
         qWarning("PDF benchmark: invalid input/scenario or output already exists");
         return 2;
     }
@@ -384,7 +419,11 @@ int run(QApplication& app) {
                 return;
             }
             origin = viewport.position();
-            if (high) {
+            if (reading) {
+                // Two viewport heights in six seconds models continuous reading,
+                // distinct from the existing fast movement pressure scenario.
+                destination = origin + QPointF(0, 2.0 * viewport.height() / viewport.zoom());
+            } else if (high) {
                 const double travel = std::max(0.0, document->pageSizeAt(0).height() - viewport.height() / 4.0);
                 destination = origin + QPointF(0, travel * .85);
                 if (travel <= 0) { finish("invalid_pan_extent"); return; }
@@ -396,7 +435,7 @@ int run(QApplication& app) {
             motionStart = now;
             viewport.phase = 1;
             phases.append(QJsonObject{{"name", "forward"}, {"at_ms", now}});
-            if (scenario == "hand") viewport.beginMeasuredPan();
+            if (hand) viewport.beginMeasuredPan();
             if (scenario == "jump") {
                 viewport.setPanOffset(destination);
                 motionEnd = now;
@@ -406,33 +445,33 @@ int run(QApplication& app) {
             return;
         }
         const double elapsed = now - motionStart;
-        if (scenario == "hand" && !handEnded && !viewport.isMeasuredPanActive()) {
+        if (hand && !handEnded && !viewport.isMeasuredPanActive()) {
             finish("gesture_interrupted"); return;
         }
-        if (scenario != "jump" && elapsed < 3000) {
-            const QPointF position = origin + (destination - origin) * (elapsed / 3000.0);
-            if (scenario == "hand") viewport.panTo(position); else viewport.setPanOffset(position);
-        } else if (scenario != "jump" && scenario != "hand" && elapsed < 3500) {
+        if (scenario != "jump" && elapsed < travelMs) {
+            const QPointF position = origin + (destination - origin) * (elapsed / travelMs);
+            if (hand) viewport.panTo(position); else viewport.setPanOffset(position);
+        } else if (scenario != "jump" && !hand && elapsed < travelMs + 500) {
             if (!paused) {
                 paused = true;
                 viewport.setPanOffset(destination);
                 viewport.phase = 3;
                 phases.append(QJsonObject{{"name", "pause"}, {"at_ms", now}});
             }
-        } else if (scenario != "jump" && elapsed < (scenario == "hand" ? 6000 : 6500)) {
+        } else if (scenario != "jump" && elapsed < travelMs * 2 + (hand ? 0 : 500)) {
             if (!reversed) {
-                if (scenario == "hand") viewport.panTo(destination); else viewport.setPanOffset(destination);
+                if (hand) viewport.panTo(destination); else viewport.setPanOffset(destination);
                 reversed = true;
                 viewport.phase = 2;
                 phases.append(QJsonObject{{"name", "return"}, {"at_ms", now}});
             }
-            const double reverseStart = scenario == "hand" ? 3000 : 3500;
+            const double reverseStart = travelMs + (hand ? 0 : 500);
             if (elapsed >= reverseStart) {
-                const QPointF position = destination + (origin - destination) * ((elapsed - reverseStart) / 3000.0);
-                if (scenario == "hand") viewport.panTo(position); else viewport.setPanOffset(position);
+                const QPointF position = destination + (origin - destination) * ((elapsed - reverseStart) / travelMs);
+                if (hand) viewport.panTo(position); else viewport.setPanOffset(position);
             }
         } else if (motionEnd < 0) {
-            if (scenario == "hand") {
+            if (hand) {
                 viewport.panTo(origin);
                 viewport.endMeasuredPan();
                 handEnded = true;
@@ -462,7 +501,7 @@ int run(QApplication& app) {
     });
     const int result = app.exec();
     if (!finished) return 2; // A manually closed window is not a successful run.
-    if (scenario == "hand" && !handEnded) viewport.endMeasuredPan();
+    if (hand && !handEnded) viewport.endMeasuredPan();
     viewport.cancelAndWaitForBackgroundThreads();
     return result;
 }

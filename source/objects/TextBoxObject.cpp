@@ -814,8 +814,12 @@ void TextBoxObject::renderInternal(QPainter& painter, qreal zoom,
             painter.scale(zoom, zoom);
             const QRectF clip(0.0, 0.0, layout->contentRect.width(),
                               availableHeight);
-            painter.setClipRect(clip);
-            layout->document->drawContents(&painter, clip);
+            painter.setClipRect(clip, Qt::IntersectClip);
+            // drawContents replaces the painter clip internally. Preserve the
+            // caller's dirty strips when compositing an existing viewport frame.
+            QAbstractTextDocumentLayout::PaintContext context;
+            context.clip = painter.clipBoundingRect();
+            layout->document->documentLayout()->draw(&painter, context);
         }
         painter.restore();
         return;
@@ -841,8 +845,10 @@ void TextBoxObject::renderInternal(QPainter& painter, qreal zoom,
             painter.scale(layout->renderScale, layout->renderScale);
 
         QRectF clip(0, 0, textRect.width() / zoom, textRect.height() / zoom);
-        painter.setClipRect(clip);
-        doc->drawContents(&painter, clip);
+        painter.setClipRect(clip, Qt::IntersectClip);
+        QAbstractTextDocumentLayout::PaintContext context;
+        context.clip = painter.clipBoundingRect();
+        doc->documentLayout()->draw(&painter, context);
     } else if (fontSize > 0.0) {
         // Plain text with fixed font size: multi-line word wrap
         qreal effectivePixelSize = fontSize * zoom;

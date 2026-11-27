@@ -45,6 +45,8 @@ step2 的 30 次测试成功，real-pan 在途任务从 23–24 降到 1，但�
 
 ## Related records
 
+- [按住平移实时内容](../bug-fix/2026-11-27-pdf-pan-live-content.md)：本篇后台复用与预算继续成立，Pan 的新需求和合成截图由该实现负责。
+
 已检索现有 PDF 决策：本篇与[可见需求调度](2026-11-27-pdf-visible-demand-scheduling.md)、[性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)部分重叠，保留其任务与资源约束，调整离屏完成结果策略；与[请求生命周期](../bug-fix/2026-11-27-pdf-render-request-lifecycle.md)部分重叠，保持 generation 所有权。遵循[手动验证](../process/2026-11-27-pdf-benchmark-manual-validation.md)和[benchmark](../testing/2026-11-27-pdf-benchmark.md)协议；[初版预览提案](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)仍不采用。
 
 接口依据：MuPDF 官方 [display-list.h](https://github.com/ArtifexSoftware/mupdf/blob/master/include/mupdf/fitz/display-list.h)、[context.h](https://github.com/ArtifexSoftware/mupdf/blob/master/include/mupdf/fitz/context.h)、[list-device.c](https://github.com/ArtifexSoftware/mupdf/blob/master/source/fitz/list-device.c)。scissor 与重放 ctm 使用同一坐标；指令表无公开精确大小接口，因此不依赖私有结构布局估算内存。

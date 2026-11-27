@@ -4157,10 +4157,10 @@ private:
      * During viewport gestures (Ctrl+wheel for zoom, Shift+wheel for horizontal pan,
      * Alt+wheel for vertical pan, touch pinch), we defer expensive rendering.
      * Instead, we capture a snapshot of the viewport and transform it during the
-     * gesture. Only when the gesture ends do we re-render at the correct DPI.
+     * gesture. Paged pan refreshes exposed content at a bounded rate; zoom
+     * defers rendering at the final DPI until the gesture ends.
      * 
-     * This provides consistent 60+ FPS during zoom and pan operations regardless
-     * of document complexity (PDF pages or edgeless tiles).
+     * Cached-frame movement avoids traversing the scene on every input event.
      * 
      * The API is designed to be called by any input source - currently keyboard+wheel,
      * but future gesture modules can call these methods directly.
@@ -4173,7 +4173,7 @@ private:
         QPixmap cachedFrame;                         ///< Viewport snapshot for fast transform
         qreal frameDevicePixelRatio = 1.0;           ///< Device pixel ratio when frame was captured
         qreal startZoom = 1.0;                       ///< Zoom level when gesture started
-        QPointF startPan;                            ///< Pan offset when gesture started
+        QPointF startPan;                            ///< Document origin of the cached frame
         
         // Zoom-specific state
         qreal targetZoom = 1.0;                      ///< Target zoom (accumulates changes)
@@ -4183,6 +4183,10 @@ private:
         
         // Pan-specific state
         QPointF targetPan;                           ///< Target pan offset (accumulates changes)
+        QPointF panFrameOrigin;                     ///< Fixed origin, avoids accumulated rounding
+        QPoint panFramePixelOffset;
+        bool panFrameDirty = false;                  ///< Content changed, not just position
+        bool panFrameRefreshDue = false;
         
         bool isActive() const { return activeType != None; }
         
@@ -4190,10 +4194,14 @@ private:
             activeType = None;
             cachedFrame = QPixmap();
             initialCentroidSet = false;
+            panFrameDirty = false;
+            panFrameRefreshDue = false;
+            panFramePixelOffset = QPoint();
         }
     };
     ViewportGestureState m_gesture;
     QTimer* m_gestureTimeoutTimer = nullptr;  ///< Fallback gesture end detection
+    QTimer* m_panFrameTimer = nullptr;        ///< Single-shot, never postponed by input
     static constexpr int GESTURE_TIMEOUT_MS = 3000;  ///< Timeout for gesture end fallback (3s)
     bool m_backtickHeld = false;  ///< Track backtick (`) key for deferred vertical pan
     
@@ -4286,6 +4294,11 @@ private:
      * real.
      */
     QPixmap grabOpaqueViewport();
+    void renderCanvas(QPainter& painter, const QRect& dirtyRect);
+    void schedulePanFrameRefresh(bool contentChanged = false);
+    void refreshPanFrame();
+    void resetViewportGesture();
+    void repaintPdfRegion(const QRegion& dirty);
     
     /**
      * @brief Update the current page index based on pan position.

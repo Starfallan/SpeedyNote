@@ -58,6 +58,8 @@ Status: implemented
 
 ## Related records
 
+- [按住平移实时内容](../bug-fix/2026-11-27-pdf-pan-live-content.md)：继续使用本篇任务上限，允许 Pan 当前需求，并更新合成截图；替代“手形仍待处理”的状态。
+
 检索活跃 PDF / benchmark 记录后的分类：
 
 - [区域执行复用](2026-11-27-pdf-region-work-reuse.md)：部分重叠；保留本篇调度和任务上限，允许完成后离屏但身份有效的结果进入原有缓存，并把深色处理移到 worker。未开始的离屏任务仍跳过。

@@ -109,6 +109,8 @@ Status: proposed
 
 ## Related records
 
+- [按住平移实时内容](../../implemented/bug-fix/2026-11-27-pdf-pan-live-content.md)：实现目标视口加载和受控截图更新；正常阅读与快速移动分别测量，Surface 性能待验证。临时低清预览仍为后续独立选择。
+
 - [区域执行复用](../../implemented/architecture/2026-11-27-pdf-region-work-reuse.md)：实现后台深色处理、两个热点 provider 及有限 display list、有效离屏完成结果复用。尚需 step3 性能实测，本篇整体性能目标仍为 proposed。
 - [初版审查与提案](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)：实施优先级已被替代，转 rejected；保留其八项代码证据、原选项理由和外部接口验证限制，避免未来再次无条件引入重复预览工作。不是 implemented 记录，不进入归档。
 - [Qt5 并发修复记录](../../../QT5_BACKPORT_BUG_TRACKING.md)：部分重叠；MuPDF 锁约束继续适用。

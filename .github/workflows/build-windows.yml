@@ -271,6 +271,11 @@ jobs:
           Set-Location ..
         shell: pwsh
 
+      - name: Verify PDF render lifecycle
+        if: ${{ inputs.pdf_benchmark }}
+        shell: pwsh
+        run: ./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory build
+
       - name: Create Inno Setup Installer
         if: ${{ !inputs.pdf_benchmark }}
         run: |
@@ -571,6 +576,11 @@ jobs:
 
           Set-Location ..
         shell: pwsh
+
+      - name: Verify PDF render lifecycle
+        if: ${{ inputs.pdf_benchmark }}
+        shell: pwsh
+        run: ./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory build
 
       - name: Create Inno Setup Installer
         if: ${{ !inputs.pdf_benchmark }}

@@ -43,6 +43,7 @@ enum class TouchGestureMode {
 #include <QMap>
 #include <QSet>
 #include <QHash>
+#include <QRegion>
 #include <atomic>
 #include <memory>
 
@@ -407,6 +408,7 @@ class DocumentViewport : public QWidget {
     
     // Allow test class to access private members
     friend class DocumentViewportTests;
+    friend class PdfRenderLifecycleTests;
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
     friend class PdfBenchmarkViewport;
     PdfBenchmark::PaintSink* m_pdfBenchmarkSink = nullptr;
@@ -3947,6 +3949,16 @@ private:
     QVector<PdfCacheEntry> m_pdfCache;
     qreal m_cachedDpi = 0;       ///< DPI at which cache was rendered
     mutable QMutex m_pdfCacheMutex;  ///< Mutex for thread-safe cache access
+    struct PdfPageRequest {
+        QString sourceId;
+        int pageIndex;
+        qreal dpi;
+        QFutureWatcher<QImage>* watcher;
+    };
+    QVector<PdfPageRequest> m_pdfPagesInFlight;  ///< Main-thread only; retired by owner
+    // Whole-page validity is independent of tile pruning and tile-only zooms.
+    std::shared_ptr<std::atomic<quint64>> m_pdfPageGeneration =
+        std::make_shared<std::atomic<quint64>>(0);
 
     // ===== High-DPI PDF tile cache (above kPdfDpiCap) =====
     /// Clarity threshold: a whole-page render stops being sharp past this DPI,
@@ -4397,8 +4409,16 @@ private:
     /// True while a tile render with this key is already in flight.
     bool isPdfTileInFlight(const QString& key) const;
 
-    /// Bump the generation, making every outstanding tile request obsolete.
-    void supersedePdfTiles();
+    /// Whole-page identity uses the same DPI comparison as the completed cache.
+    bool isPdfPageInFlight(const QString& sourceId, int pageIndex, qreal dpi) const;
+
+    /// Re-evaluate current demand after an obsolete request releases its identity.
+    void retryPdfPreloadAfterDiscard();
+
+    /// Only visible occurrences of this source page need repainting. An empty
+    /// region denotes the whole page; gesture snapshots cannot show new results.
+    QRegion pdfRepaintRegion(const QString& sourceId, int pageIndex,
+                             const QRectF& regionUnits = QRectF()) const;
 
     /// Drop the tile cache and supersede outstanding requests (zoom change).
     void invalidatePdfTileCache();

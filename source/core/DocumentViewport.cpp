@@ -5495,6 +5495,13 @@ QPixmap DocumentViewport::getCachedPdfPage(const QString& sourceId, int pageInde
     if (!cached.isNull()) {
         return cached;
     }
+
+    // The worker (or its queued completion callback) already owns this page.
+    // Never wait here or render it a second time on the GUI thread. Its result
+    // will repaint the visible page; failed results also request that repaint.
+    if (isPdfPageInFlight(sourceId, pageIndex, dpi)) {
+        return QPixmap();
+    }
     
     // Cache miss - render synchronously (for visible pages that MUST be shown).
     // This should only happen on first paint of a new page (settled state).
@@ -5571,6 +5578,55 @@ QPixmap DocumentViewport::getCachedPdfPage(const QString& sourceId, int pageInde
     return pixmap;
 }
 
+bool DocumentViewport::isPdfPageInFlight(const QString& sourceId, int pageIndex, qreal dpi) const
+{
+    // Main-thread only, matching the completed cache's identity without
+    // allocating a formatted string on every cache miss in paintEvent().
+    for (const PdfPageRequest& request : m_pdfPagesInFlight) {
+        if (request.sourceId == sourceId && request.pageIndex == pageIndex
+            && qFuzzyCompare(request.dpi, dpi)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DocumentViewport::retryPdfPreloadAfterDiscard()
+{
+    // Invalidation deliberately retains in-flight keys. A newer request for the
+    // same key may therefore have been deferred; re-evaluate the latest view
+    // once the old owner finishes. Do not restart an already scheduled pass.
+    if (m_document && m_pdfPreloadTimer && !m_pdfPreloadTimer->isActive()) {
+        m_pdfPreloadTimer->start(0);
+    }
+}
+
+QRegion DocumentViewport::pdfRepaintRegion(const QString& sourceId, int pageIndex,
+                                          const QRectF& regionUnits) const
+{
+    QRegion dirty;
+    if (!m_document || m_document->isEdgeless()
+        || (m_gesture.isActive() && !m_gesture.cachedFrame.isNull())) {
+        return dirty;
+    }
+    // visiblePages() uses the existing layout index. Repeated source pages can
+    // occur at several notebook positions; repaint every visible occurrence.
+    for (int index : visiblePages()) {
+        const Page* page = m_document->page(index);
+        if (!page || page->backgroundType != Page::BackgroundType::PDF
+            || page->pdfSourceId != sourceId || page->pdfPageNumber != pageIndex) {
+            continue;
+        }
+        const QRectF pageBounds(QPointF(0, 0), page->size);
+        const QRectF local = regionUnits.isEmpty() ? pageBounds : regionUnits.intersected(pageBounds);
+        if (local.isEmpty()) continue;
+        const QRectF viewportRect((local.topLeft() + pagePosition(index) - m_panOffset) * m_zoomLevel,
+                                  local.size() * m_zoomLevel);
+        dirty += viewportRect.toAlignedRect().intersected(rect());
+    }
+    return dirty;
+}
+
 void DocumentViewport::preloadPdfCache()
 {
     // Debounce: restart timer on each call
@@ -5636,7 +5692,7 @@ void DocumentViewport::doAsyncPdfPreload()
                     break;
                 }
             }
-            if (alreadyCached) {
+            if (alreadyCached || isPdfPageInFlight(sourceId, pdfPageNum, dpi)) {
                 continue;
             }
             
@@ -5662,17 +5718,22 @@ void DocumentViewport::doAsyncPdfPreload()
         const int pdfPageNum = item.pdfPageNum;
         const int renderPageNum = item.renderPageNum;
         const QString pdfPath = item.path;
+        // Repeated notebook pages can refer to the same source page within
+        // this batch. Claim the identity before creating the next request.
+        if (isPdfPageInFlight(sourceId, pdfPageNum, dpi)) {
+            continue;
+        }
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
+        m_pdfPagesInFlight.append({sourceId, pdfPageNum, dpi, watcher});
         
         // Track watcher for cleanup
         m_activePdfWatchers.append(watcher);
         
-        // Same supersede token as the tile path: invalidatePdfCache() bumps it, so
-        // a render that was already running when the document, source or zoom
-        // changed cannot be inserted afterwards (cancelling the watcher does not
-        // wait for the rasterisation, so the finished signal can still arrive).
-        const quint64 generation = m_pdfTileGeneration->load();
-        const auto generationToken = m_pdfTileGeneration;
+        // Ordinary tile pruning must not discard a still-valid whole page.
+        // Full invalidation advances both paths; each worker owns a shared token
+        // so it never dereferences a destroyed viewport.
+        const quint64 generation = m_pdfPageGeneration->load();
+        const auto generationToken = m_pdfPageGeneration;
 
         // THREAD SAFETY FIX: QPixmap must only be created on the main thread.
         // The background thread returns QImage, and we convert to QPixmap here
@@ -5682,6 +5743,12 @@ void DocumentViewport::doAsyncPdfPreload()
             // BUG-A006 FIX: Check if watcher was cancelled (e.g., by invalidatePdfCache)
             // This happens when document/page changes while render is in progress
             m_activePdfWatchers.removeOne(watcher);
+            m_pdfPagesInFlight.erase(
+                std::remove_if(m_pdfPagesInFlight.begin(), m_pdfPagesInFlight.end(),
+                               [watcher](const PdfPageRequest& request) {
+                                   return request.watcher == watcher;
+                               }),
+                m_pdfPagesInFlight.end());
             
             bool wasCancelled = watcher->isCanceled();
             QImage pdfImage;
@@ -5691,16 +5758,27 @@ void DocumentViewport::doAsyncPdfPreload()
             delete watcher;
             
             if (wasCancelled || generation != generationToken->load()) {
+                retryPdfPreloadAfterDiscard();
                 return;
             }
             
             // Check if rendering failed
             if (pdfImage.isNull()) {
+                // A settled paint may have deferred to this request. Let the
+                // existing synchronous miss path retry once when it is visible.
+                const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum);
+                if (!dirty.isEmpty()) update(dirty);
                 return;
             }
             
             // Guard against document changing between render start and signal delivery
             if (!m_document) {
+                return;
+            }
+
+            // A result can already be cached by another path. Reject it before
+            // image-region extraction, dark conversion and QPixmap allocation.
+            if (!lookupCachedPdfPage(sourceId, pdfPageNum, dpi).isNull()) {
                 return;
             }
 
@@ -5718,13 +5796,6 @@ void DocumentViewport::doAsyncPdfPreload()
             
             // Add to cache (thread-safe access to shared cache)
             QMutexLocker locker(&m_pdfCacheMutex);
-            
-            // Check if already added (race condition prevention)
-            for (const PdfCacheEntry& entry : m_pdfCache) {
-                if (entry.matches(sourceId, pdfPageNum, dpi)) {
-                    return;  // Already cached by another path
-                }
-            }
             
             PdfCacheEntry entry;
             entry.sourceId = sourceId;
@@ -5748,21 +5819,28 @@ void DocumentViewport::doAsyncPdfPreload()
             
             m_pdfCache.append(entry);
             m_cachedDpi = dpi;
-            
-            // Trigger repaint to show newly cached page
-            update();
+            locker.unlock();
+
+            // Off-screen preloads do not alter the current frame. Qt coalesces
+            // visible page regions from multiple callbacks into one update.
+            const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum);
+            if (!dirty.isEmpty()) update(dirty);
         });
         
         // Background thread: render PDF to QImage (thread-safe)
         // NOTE: QImage is explicitly documented as thread-safe for read operations
         // and can be safely passed between threads.
-        QFuture<QImage> future = QtConcurrent::run([renderPageNum, dpi, pdfPath]() -> QImage {
+        QFuture<QImage> future = QtConcurrent::run([renderPageNum, dpi, pdfPath,
+                                                  generation, generationToken]() -> QImage {
+            if (generation != generationToken->load()) {
+                return QImage();
+            }
             // Use thread-local cached PDF provider to avoid re-opening the PDF
             // for every page render. Each thread pool worker caches its own provider
             // (keyed by resolved source path).
             ThreadPdfCache& cache = s_threadPdfCache.localData();
             PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-            if (!threadPdf || !threadPdf->isValid()) {
+            if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load()) {
                 return QImage();  // Return null image on failure
             }
             
@@ -5785,12 +5863,17 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
 {
     if (m_pdfPreloadTimer)
         m_pdfPreloadTimer->stop();
+    ++(*m_pdfPageGeneration);
+    ++(*m_pdfTileGeneration);
     for (QFutureWatcher<QImage>* watcher : m_activePdfWatchers) {
         watcher->cancel();
         watcher->waitForFinished();
         delete watcher;
     }
     m_activePdfWatchers.clear();
+    // All owners have now been joined and deleted, including their callbacks.
+    m_pdfPagesInFlight.clear();
+    m_pdfTilesInFlight.clear();
 }
 
 void DocumentViewport::invalidatePdfCache()
@@ -5803,7 +5886,13 @@ void DocumentViewport::invalidatePdfCache()
     // Every outstanding render now produces an image the view can no longer show:
     // bump the generation so workers bail before rasterising and finished
     // handlers discard whatever is already in flight.
-    supersedePdfTiles();
+    ++(*m_pdfPageGeneration);
+    for (QFutureWatcher<QImage>* watcher : m_activePdfWatchers) {
+        watcher->cancel();
+    }
+    // Keep in-flight identities until their owning callbacks retire them. A
+    // canceled worker may still be rasterising, so clearing here permits a
+    // duplicate job and lets its older callback retire the newer job's key.
 
     // Thread-safe cache clear. The tile cache is cleared without holding this
     // mutex; the lock order is page -> tile everywhere.
@@ -5820,24 +5909,6 @@ void DocumentViewport::invalidatePdfCache()
 
     invalidatePdfTileCache();
     m_pdfPageSizePtCache.clear();
-}
-
-void DocumentViewport::supersedePdfTiles()
-{
-    // Renderers already inside fz_run_page() cannot be interrupted (there is no
-    // cooperative cancellation point), so this is a discard, not a cancel: the
-    // worker gives up before starting, and the finished handler drops the result.
-    ++(*m_pdfTileGeneration);
-
-    for (QFutureWatcher<QImage>* watcher : m_activePdfWatchers) {
-        watcher->cancel();
-    }
-
-    // Deliberately NOT clearing m_pdfTilesInFlight: each key is retired by the
-    // handler that created it. Clearing it here let a new request for the same
-    // region start while the old one was still running, and then the old
-    // handler removed the new request's key -- so the same region could be
-    // rasterised three times over for one zoom step.
 }
 
 void DocumentViewport::invalidatePdfTileCache()
@@ -5859,6 +5930,9 @@ void DocumentViewport::invalidatePdfTileCache()
 
 void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageIndex)
 {
+    // Match the single-page tile invalidation rule: queued old content must
+    // not be inserted again. Page-scoped epochs can refine this if needed.
+    ++(*m_pdfPageGeneration);
     // Thread-safe page removal
     QMutexLocker locker(&m_pdfCacheMutex);
     m_pdfCache.erase(
@@ -21581,17 +21655,14 @@ void DocumentViewport::insertPdfTile(const PdfTileEntry& entry)
 void DocumentViewport::prunePdfTiles()
 {
     // Below the tiled regime no tile can be painted at all, so the whole cache
-    // goes (this also supersedes outstanding requests).
+    // goes. Only tile requests are superseded; page preloads remain valid.
     if (!usesTiledPdfRender()) {
         invalidatePdfTileCache();
         return;
     }
 
-    // Inside the regime there is no single "current tile DPI" to compare against
-    // any more -- each region derives its own from its own size -- and a stale
-    // entry cannot be painted by mistake: lookupCachedPdfTiles() matches the DPI
-    // exactly and the coverage test rejects anything rendered for another zoom.
-    // Capacity and distance-based eviction handle the rest.
+    // In the tiled regime zoom invalidation and DPI-matched lookups prevent
+    // stale images from being painted. Capacity eviction handles panning.
 }
 
 void DocumentViewport::doAsyncPdfTilePreload()
@@ -21661,11 +21732,11 @@ void DocumentViewport::doAsyncPdfTilePreload()
         const QString key = QStringLiteral("%1|%2|%3|%4|%5|%6|%7")
                                 .arg(sourceId)
                                 .arg(pdfPageNum)
-                                .arg(tileDpi)
-                                .arg(region.xUnits)
-                                .arg(region.yUnits)
-                                .arg(region.wUnits)
-                                .arg(region.hUnits);
+                                .arg(tileDpi, 0, 'g', 17)
+                                .arg(region.xUnits, 0, 'g', 17)
+                                .arg(region.yUnits, 0, 'g', 17)
+                                .arg(region.wUnits, 0, 'g', 17)
+                                .arg(region.hUnits, 0, 'g', 17);
         if (isPdfTileInFlight(key)) {
             continue;  // A render for exactly this region is already running
         }
@@ -21703,9 +21774,17 @@ void DocumentViewport::doAsyncPdfTilePreload()
             // Dropping it here is the whole of "cancellation" -- MuPDF has no
             // cooperative cancellation point, so work already inside
             // fz_run_page() always runs to completion.
-            if (wasCancelled || generation != generationToken->load() ||
-                tileImage.isNull() || !m_document) {
+            if (wasCancelled || generation != generationToken->load()) {
+                retryPdfPreloadAfterDiscard();
                 return;
+            }
+            if (tileImage.isNull() || !m_document) {
+                return;
+            }
+
+            // Avoid expensive post-processing for an already supplied region.
+            for (const PdfTileEntry& cached : lookupCachedPdfTiles(sourceId, pdfPageNum, tileDpi)) {
+                if (cached.regionUnits.contains(regionUnits)) return;
             }
 
             // Dark mode: the backend reports raster-image rectangles relative to
@@ -21747,7 +21826,8 @@ void DocumentViewport::doAsyncPdfTilePreload()
             entry.pixmap = QPixmap::fromImage(tileImage);
             insertPdfTile(entry);
 
-            update();
+            const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum, regionUnits);
+            if (!dirty.isEmpty()) update(dirty);
         });
 
         // Background thread: rasterise just this region (thread-safe provider).
@@ -21761,7 +21841,7 @@ void DocumentViewport::doAsyncPdfTilePreload()
                 }
                 ThreadPdfCache& cache = s_threadPdfCache.localData();
                 PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-                if (!threadPdf || !threadPdf->isValid()) {
+                if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load()) {
                     return QImage();
                 }
                 QImage result = threadPdf->renderPageRegionToImage(renderPageNum, tileDpi, regionPt);

@@ -158,6 +158,14 @@ node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/paired --cand
 
 ## 验证工具
 
+后续候选构建另外包含 PDF 请求生命周期功能测试，覆盖去重、失效、文档切换和局部重绘。Windows Benchmark workflow 会在编译后自动执行；也可在本机调用：
+
+```powershell
+./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory out/pdf-benchmark/build-candidate
+```
+
+该测试使用 offscreen 平台，不生成性能数据。`68ac33a` 对照包没有此测试入口，不需对旧包运行。候选的 `pdf-render-lifecycle.json` 记录每项检查结果，失败会阻止 workflow 上传候选包。本地环境尚未编译运行该测试。
+
 ```powershell
 node --check benchmarks/pdf/bench.mjs
 node --test benchmarks/pdf/bench.test.mjs

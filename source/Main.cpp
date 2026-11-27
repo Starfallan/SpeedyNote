@@ -18,6 +18,10 @@
 #include "ui/launcher/Launcher.h"
 #include "platform/SystemNotification.h"
 #include "core/DocumentViewport.h"
+#if !defined(Q_OS_ANDROID) && !defined(Q_OS_IOS) && !defined(Q_OS_HARMONY) \
+    && (defined(SPEEDYNOTE_DEBUG) || defined(SPEEDYNOTE_PDF_BENCHMARK))
+#include "core/PdfRenderLifecycleTests.h"
+#endif
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
 #include "benchmarks/PdfBenchmark.h"
 #endif
@@ -1230,6 +1234,13 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setOrganizationName("SpeedyNote");
     app.setApplicationName("App");
+
+#if !defined(Q_OS_ANDROID) && !defined(Q_OS_IOS) && !defined(Q_OS_HARMONY) \
+    && (defined(SPEEDYNOTE_DEBUG) || defined(SPEEDYNOTE_PDF_BENCHMARK))
+    const int pdfLifecycleTest = app.arguments().indexOf(QStringLiteral("--test-pdf-render-lifecycle"));
+    if (pdfLifecycleTest >= 0)
+        return PdfRenderLifecycleTests::run(app.arguments().value(pdfLifecycleTest + 1));
+#endif
 
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
     // Before session restore, settings initialization and single-instance IPC.

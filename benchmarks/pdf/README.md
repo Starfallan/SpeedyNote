@@ -153,6 +153,8 @@ node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchma
 
 ## 比较候选改动
 
+第二步候选提供滚动中的可见需求调度和任务上限，普通整页 miss 不再同步渲染。其测试标签可用 `--label step2`。原生探针和 runner 未修改，可与已有 baseline / step1 对比；先使用 `--case text-scroll --repeat 1` 检查滚动过程中是否出现内容，再测 `real-scroll` / `real-pan`。单视口的 `sampled_max_pending` 应不超过 1，但这是采样值，完整并发约束由手动功能测试检查。手形截图路径未在第二步修改，不能期待 `vector-hand` 的新区域空白因此消失。
+
 保留 baseline 完整目录；candidate 放在另一个目录，使用相同语料与测量代码。在同一设备、同一时段交替测量 A/B、B/A，减少运行顺序造成的偏差：
 
 ```powershell
@@ -177,6 +179,8 @@ node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/paired --cand
 ```
 
 该测试使用便携包已有的 Windows 平台插件，不显示测试窗口、不生成性能数据。脚本启动前检查 `platforms/qwindows.dll`，无需额外部署 offscreen 插件。`68ac33a` 对照包没有此测试入口，不需对旧包运行。候选的 `pdf-render-lifecycle.json` 记录每项检查结果；脚本用非零退出码报告失败。它拒绝覆盖已有报告，重试前应自行保留并移走旧报告。修正后的手动测试尚未在实际设备运行。
+
+第二步增加首屏 miss 的异步检查、连续移动后的最新需求、滚动未停止时完成加载，以及多个视口共享提交额度和释放预留的检查。它继续使用原有手动入口。
 
 ```powershell
 node --check benchmarks/pdf/bench.mjs

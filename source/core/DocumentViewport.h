@@ -2703,7 +2703,7 @@ public slots:
     /**
      * @brief True while the immediate-pan route (wheel/touchpad/scroll-bar) is
      * actively scrolling, i.e. within SCROLL_SETTLE_MS of the last scroll event.
-     * Used to defer heavy housekeeping (and, in SP2, synchronous rendering).
+     * Used to defer heavy housekeeping and speculative PDF neighbours.
      */
     bool isScrolling() const { return m_scrollActive; }
     
@@ -4007,9 +4007,15 @@ private:
     mutable QHash<QString, QSizeF> m_pdfPageSizePtCache;
     
     // ===== Async PDF Preloading =====
-    QTimer* m_pdfPreloadTimer = nullptr;  ///< Debounce timer for preload requests
+    QTimer* m_pdfPreloadTimer = nullptr;  ///< Coalesces latest visible demand
     QList<QFutureWatcher<QImage>*> m_activePdfWatchers;  ///< Active async render operations (returns QImage for thread safety)
-    static constexpr int PDF_PRELOAD_DELAY_MS = 150;   ///< Debounce delay (ms) before preloading
+    // One admitted render per viewport; all viewports also share a process-wide
+    // admission limit. No list of obsolete viewport positions is queued.
+    int m_pdfRenderPageIndex = -1;
+    QRectF m_pdfRenderRegion;
+    double m_pdfReservedPixels = 0;
+    std::shared_ptr<std::atomic<bool>> m_pdfRenderObsolete;
+    QSet<QString> m_failedPdfRequests;  ///< Retry only after explicit demand changes
 
     // ===== Scroll-activity gate (SP1) =====
     // The immediate-pan route (wheel/touchpad/scroll-bar) marks itself active on
@@ -4309,10 +4315,10 @@ private:
     // ===== PDF Cache Helpers (Task 1.3.6) =====
     
     /**
-     * @brief Get a cached PDF page pixmap, rendering if necessary.
+     * @brief Get a cached PDF page pixmap, scheduling a miss asynchronously.
      * @param pageIndex The page index.
      * @param dpi The target DPI.
-     * @return Cached or freshly rendered pixmap (may be null if not a PDF page).
+     * @return Cached pixmap, or null while the requested content is unavailable.
      */
     QPixmap getCachedPdfPage(const QString& sourceId, int pageIndex, qreal dpi);
 
@@ -4325,16 +4331,19 @@ private:
 
     
     /**
-     * @brief Request PDF preload (debounced).
-     * Called during scroll - actual preload happens after delay.
+     * @brief Coalesce current PDF demand without waiting for scrolling to stop.
      */
     void preloadPdfCache();
     
     /**
-     * @brief Actually perform async PDF preload.
-     * Called by timer after debounce delay. Runs in background threads.
+     * @brief Admit at most one job for the latest viewport, visible pages first.
      */
     void doAsyncPdfPreload();
+    bool acquirePdfRenderSlot(double pixels, int pageIndex, const QRectF& region = QRectF());
+    void releasePdfRenderSlot();
+    void withdrawPdfRenderDemand();
+    void discardOffscreenPdfRequest();
+    static void wakePdfRenderWaiters();
 
     // ===== High-DPI tiled PDF rendering =====
     // Above kPdfDpiCap the whole page is never rendered at screen DPI; instead
@@ -4412,9 +4421,6 @@ private:
     /// Whole-page identity uses the same DPI comparison as the completed cache.
     bool isPdfPageInFlight(const QString& sourceId, int pageIndex, qreal dpi) const;
 
-    /// Re-evaluate current demand after an obsolete request releases its identity.
-    void retryPdfPreloadAfterDiscard();
-
     /// Only visible occurrences of this source page need repainting. An empty
     /// region denotes the whole page; gesture snapshots cannot show new results.
     QRegion pdfRepaintRegion(const QString& sourceId, int pageIndex,
@@ -4428,12 +4434,9 @@ private:
      * Sets m_scrollActive and restarts the settle timer. Cheap; called on
      * every wheel/touchpad/scroll-bar event instead of preloading/evicting.
      *
-     * @param steppedScroll True for a discrete mouse-wheel step. On the Qt5
-     *        build such steps skip the SP2 "cache-only while scrolling" gate so
-     *        the freshly revealed page renders synchronously (its pre-SP2, and
-     *        still instant, behavior) instead of flashing blank until the settle
-     *        timer fires. Continuous sources (scroll-bar drag, touchpad) keep
-     *        the deferred path. On Qt6 this flag is ignored (behavior unchanged).
+     * @param steppedScroll Qt5 discrete wheel events leave the scroll flag
+     *        clear, allowing neighbour prefetch. Qt6 treats all scrolling as
+     *        continuous. Visible PDF demand is asynchronous in either case.
      */
     void onScrollActivity(bool steppedScroll = false);
 

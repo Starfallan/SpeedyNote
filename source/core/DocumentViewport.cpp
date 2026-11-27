@@ -28,6 +28,8 @@
 #include <QPaintEvent>
 #include <QRegion>
 #include <QResizeEvent>
+#include <QPointer>
+#include <QThread>
 #include <QMouseEvent>
 #include <QContextMenuEvent>
 #include <QTabletEvent>
@@ -172,6 +174,18 @@ struct ThreadPdfCache {
 // Thread-local storage: each worker thread in QThreadPool gets its own cache
 static QThreadStorage<ThreadPdfCache> s_threadPdfCache;
 
+// GUI-thread admission, shared by all document viewports. Keep the existing
+// worker pool; do not multiply its concurrency or retain a queue of page jobs.
+// Waiters contain one weak viewport reference each, never render snapshots.
+static QList<QPointer<DocumentViewport>> s_pdfRenderWaiters;
+static int s_pdfActiveRenders = 0;
+static double s_pdfReservedPixels = 0;
+static constexpr double kPdfInFlightPixels = 64.0 * 1024.0 * 1024.0;
+static int pdfRenderConcurrency()
+{
+    return qBound(1, QThread::idealThreadCount() / 2, 2);
+}
+
 // ===== Constructor & Destructor =====
 
 DocumentViewport::DocumentViewport(QWidget* parent)
@@ -215,7 +229,7 @@ DocumentViewport::DocumentViewport(QWidget* parent)
         m_lassoMode = (mode == 1) ? LassoMode::Rectangle : LassoMode::Freeform;
     }
     
-    // PDF preload timer - debounces preload requests during rapid scrolling
+    // PDF demand timer - coalesces requests without waiting for scroll settle
     m_pdfPreloadTimer = new QTimer(this);
     m_pdfPreloadTimer->setSingleShot(true);
     connect(m_pdfPreloadTimer, &QTimer::timeout, this, &DocumentViewport::doAsyncPdfPreload);
@@ -1403,6 +1417,7 @@ void DocumentViewport::setZoomLevel(qreal zoom)
     if (qFuzzyCompare(m_zoomLevel, zoom)) {
         return;
     }
+    m_failedPdfRequests.clear();
 
     // Pan/zoom is in flight: suspend the focus cache so the next paint
     // takes the cache-free Direct tier instead of rebuilding a viewport-
@@ -1471,29 +1486,23 @@ void DocumentViewport::setPanOffset(QPointF offset, bool steppedScroll)
     emit panChanged(m_panOffset);
     emitScrollFractions();
     
-    // SP1: defer the heavy housekeeping (PDF preload, stroke-cache preload, tile
-    // eviction) to onScrollSettled() so it runs once ~SCROLL_SETTLE_MS after the
-    // user stops scrolling instead of on every wheel/touchpad event.
+    // Stroke-cache preparation and eviction remain deferred. Visible PDF
+    // demand is handled independently, including while input continues.
     onScrollActivity(steppedScroll);
+    m_failedPdfRequests.clear();
+    discardOffscreenPdfRequest();
+    preloadPdfCache();
 }
 
 void DocumentViewport::onScrollActivity(bool steppedScroll)
 {
+    // Preserve Qt5 discrete-scroll bookkeeping. PDF painting is asynchronous
+    // on both Qt versions; this flag now controls neighbour prefetch only.
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    // Qt6: behavior unchanged - always gate rendering to cache-only while
-    // scrolling (SP2). The discrete-step distinction below is Qt5-only.
     Q_UNUSED(steppedScroll);
     m_scrollActive = true;
 #else
-    // Qt5: a discrete mouse-wheel step renders synchronously (its pre-SP2, still
-    // instant, behavior). Under SP2 the cache-only-while-scrolling gate leaves
-    // the newly revealed page blank until the settle timer fires ~SCROLL_SETTLE_MS
-    // later; on the Qt5 build the adjacent-page async preload does not fill the
-    // cache in time, so every notch flashes blank and stalls. Do NOT mark the
-    // stepped route active so paintEvent takes the synchronous getCachedPdfPage
-    // path. Continuous sources (scroll-bar drag, touchpad pixel-delta) keep the
-    // deferred cache-only path. Heavy housekeeping stays deferred either way.
-    m_scrollActive = steppedScroll ? false : true;
+    m_scrollActive = !steppedScroll;
 #endif
     if (m_scrollSettleTimer) {
         m_scrollSettleTimer->start();
@@ -1508,14 +1517,13 @@ void DocumentViewport::onScrollSettled()
     }
 
     // Visible pages may have changed while scrolling: resize the cache first,
-    // then preload adjacent pages (async, debounced) and reclaim memory.
+    // then allow adjacent-page prefetch and reclaim memory.
     updatePdfCacheCapacity();
     preloadPdfCache();
     preloadStrokeCaches();
     evictDistantTiles();
 
-    // Final clean repaint (matters in SP2, where painting draws cache-only
-    // while scrolling and needs one repaint to show freshly rendered pages).
+    // Final repaint after deferred stroke/cache housekeeping.
     update();
 }
 
@@ -4462,8 +4470,8 @@ void DocumentViewport::wheelEvent(QWheelEvent* event)
         // Plain wheel (no modifier) → Immediate scroll (unchanged behavior).
         // A discrete mouse wheel reports angleDelta (no pixelDelta); a touchpad
         // reports pixelDelta as a high-frequency stream. Flag the discrete wheel
-        // as a "stepped" scroll so the Qt5 build renders it synchronously instead
-        // of flashing blank (see onScrollActivity). Qt6 ignores the flag.
+        // as "stepped" for Qt5 neighbour-prefetch bookkeeping. Visible PDF
+        // requests use the same asynchronous path; Qt6 ignores the flag.
         const bool steppedWheel = pixelDelta.isNull() && !angleDelta.isNull();
         scrollBy(scrollDelta, steppedWheel);
     }
@@ -5481,101 +5489,14 @@ QPixmap DocumentViewport::lookupCachedPdfPage(const QString& sourceId, int pageI
             return entry.pixmap;  // Cache hit
         }
     }
-    return QPixmap();  // Miss - caller decides whether to render synchronously
+    return QPixmap();  // Miss - the caller schedules asynchronous demand
 }
 
 QPixmap DocumentViewport::getCachedPdfPage(const QString& sourceId, int pageIndex, qreal dpi)
 {
-    if (!m_document) {
-        return QPixmap();
-    }
-    
-    // Fast path: return the cached pixmap if present (no render).
-    QPixmap cached = lookupCachedPdfPage(sourceId, pageIndex, dpi);
-    if (!cached.isNull()) {
-        return cached;
-    }
-
-    // The worker (or its queued completion callback) already owns this page.
-    // Never wait here or render it a second time on the GUI thread. Its result
-    // will repaint the visible page; failed results also request that repaint.
-    if (isPdfPageInFlight(sourceId, pageIndex, dpi)) {
-        return QPixmap();
-    }
-    
-    // Cache miss - render synchronously (for visible pages that MUST be shown).
-    // This should only happen on first paint of a new page (settled state).
-    // The expensive render runs without holding the cache mutex; we lock only
-    // to insert the result below.
-    
-#ifdef SPEEDYNOTE_DEBUG
-    // Build cache contents string for debug
-    QString cacheContents;
-    {
-        QMutexLocker debugLocker(&m_pdfCacheMutex);
-        for (const PdfCacheEntry& e : m_pdfCache) {
-            if (!cacheContents.isEmpty()) cacheContents += ",";
-            cacheContents += QString::number(e.pageIndex);
-        }
-    }
-    qDebug() << "PDF CACHE MISS: rendering page" << pageIndex 
-             << "| cache has [" << cacheContents << "] capacity=" << m_pdfCacheCapacity;
-#endif
-    
-    // Render the page (expensive operation - done outside mutex)
-    QImage pdfImage = m_document->renderPdfPageToImage(sourceId, pageIndex, dpi);
-    if (pdfImage.isNull()) {
-        return QPixmap();
-    }
-
-    // Apply HSL lightness inversion for PDF dark mode
-    if (m_isDarkMode && m_pdfDarkModeEnabled) {
-        QVector<QRect> imgRegions;
-        if (!m_skipImageMasking) {
-            imgRegions = m_document->pdfImageRegions(sourceId, pageIndex, dpi);
-        }
-        DarkModeUtils::invertImageLightness(pdfImage, imgRegions);
-    }
-    
-    m_document->trimPdfStore();
-    
-    QPixmap pixmap = QPixmap::fromImage(pdfImage);
-    
-    // Add to cache (thread-safe)
-    QMutexLocker locker(&m_pdfCacheMutex);
-    
-    // Double-check it wasn't added by another thread while we were rendering
-    for (const PdfCacheEntry& entry : m_pdfCache) {
-        if (entry.matches(sourceId, pageIndex, dpi)) {
-            return entry.pixmap;  // Another thread added it
-        }
-    }
-    
-    PdfCacheEntry entry;
-    entry.sourceId = sourceId;
-    entry.pageIndex = pageIndex;
-    entry.dpi = dpi;
-    entry.pixmap = pixmap;
-    
-    // If cache is full, evict the page FURTHEST from current page (smart eviction)
-    // This prevents evicting pages we're about to need (like the next visible page)
-    if (m_pdfCache.size() >= m_pdfCacheCapacity) {
-        int evictIndex = 0;
-        int maxDistance = -1;
-        for (int i = 0; i < m_pdfCache.size(); ++i) {
-            int distance = qAbs(m_pdfCache[i].pageIndex - pageIndex);
-            if (distance > maxDistance) {
-                maxDistance = distance;
-                evictIndex = i;
-            }
-        }
-        m_pdfCache.removeAt(evictIndex);
-    }
-    
-    m_pdfCache.append(entry);
-    m_cachedDpi = dpi;
-    
-    return pixmap;
+    const QPixmap cached = lookupCachedPdfPage(sourceId, pageIndex, dpi);
+    if (cached.isNull()) preloadPdfCache();
+    return cached;
 }
 
 bool DocumentViewport::isPdfPageInFlight(const QString& sourceId, int pageIndex, qreal dpi) const
@@ -5591,14 +5512,69 @@ bool DocumentViewport::isPdfPageInFlight(const QString& sourceId, int pageIndex,
     return false;
 }
 
-void DocumentViewport::retryPdfPreloadAfterDiscard()
+void DocumentViewport::wakePdfRenderWaiters()
 {
-    // Invalidation deliberately retains in-flight keys. A newer request for the
-    // same key may therefore have been deferred; re-evaluate the latest view
-    // once the old owner finishes. Do not restart an already scheduled pass.
-    if (m_document && m_pdfPreloadTimer && !m_pdfPreloadTimer->isActive()) {
-        m_pdfPreloadTimer->start(0);
+    s_pdfRenderWaiters.erase(std::remove_if(s_pdfRenderWaiters.begin(), s_pdfRenderWaiters.end(),
+        [](const QPointer<DocumentViewport>& view) { return view.isNull(); }), s_pdfRenderWaiters.end());
+    const int available = pdfRenderConcurrency() - s_pdfActiveRenders;
+    for (int i = 0; i < qMin(available, int(s_pdfRenderWaiters.size())); ++i) {
+        auto* view = s_pdfRenderWaiters[i].data();
+        if (!view->m_pdfPreloadTimer->isActive()) view->m_pdfPreloadTimer->start(0);
     }
+}
+
+void DocumentViewport::withdrawPdfRenderDemand()
+{
+    s_pdfRenderWaiters.removeAll(QPointer<DocumentViewport>(this));
+    wakePdfRenderWaiters();
+}
+
+bool DocumentViewport::acquirePdfRenderSlot(double pixels, int pageIndex, const QRectF& region)
+{
+    if (!m_activePdfWatchers.isEmpty()) return false;
+    if (!s_pdfRenderWaiters.contains(QPointer<DocumentViewport>(this)))
+        s_pdfRenderWaiters.append(QPointer<DocumentViewport>(this));
+    if (s_pdfActiveRenders >= pdfRenderConcurrency()
+        || s_pdfRenderWaiters.first().data() != this
+        || (s_pdfActiveRenders > 0 && s_pdfReservedPixels + pixels > kPdfInFlightPixels))
+        return false;
+    s_pdfRenderWaiters.removeFirst();
+    ++s_pdfActiveRenders;
+    m_pdfReservedPixels = qMax(1.0, pixels);
+    s_pdfReservedPixels += m_pdfReservedPixels;
+    m_pdfRenderPageIndex = pageIndex;
+    m_pdfRenderRegion = region;
+    m_pdfRenderObsolete = std::make_shared<std::atomic<bool>>(false);
+    wakePdfRenderWaiters();
+    return true;
+}
+
+void DocumentViewport::releasePdfRenderSlot()
+{
+    if (m_pdfReservedPixels <= 0) return;
+    --s_pdfActiveRenders;
+    s_pdfReservedPixels = qMax(0.0, s_pdfReservedPixels - m_pdfReservedPixels);
+    m_pdfReservedPixels = 0;
+    m_pdfRenderPageIndex = -1;
+    m_pdfRenderRegion = QRectF();
+    m_pdfRenderObsolete.reset();
+    wakePdfRenderWaiters();
+}
+
+void DocumentViewport::discardOffscreenPdfRequest()
+{
+    if (!m_pdfRenderObsolete || !m_document || m_pdfRenderPageIndex < 0) return;
+    if (m_pdfRenderPageIndex >= m_document->pageCount()) {
+        m_pdfRenderObsolete->store(true);
+        return;
+    }
+    const QRectF pageBounds(pagePosition(m_pdfRenderPageIndex),
+                            m_document->pageSizeAt(m_pdfRenderPageIndex));
+    const QRectF requested = m_pdfRenderRegion.isEmpty() ? pageBounds
+        : m_pdfRenderRegion.translated(pageBounds.topLeft());
+    // A partially useful region may finish. A queued request that no longer
+    // intersects the view can skip provider opening and rasterisation.
+    if (!requested.intersects(visibleRect())) m_pdfRenderObsolete->store(true);
 }
 
 QRegion DocumentViewport::pdfRepaintRegion(const QString& sourceId, int pageIndex,
@@ -5629,18 +5605,25 @@ QRegion DocumentViewport::pdfRepaintRegion(const QString& sourceId, int pageInde
 
 void DocumentViewport::preloadPdfCache()
 {
-    // Debounce: restart timer on each call
-    // Actual preloading happens after user stops scrolling
-    if (m_pdfPreloadTimer) {
-        m_pdfPreloadTimer->start(PDF_PRELOAD_DELAY_MS);
-    }
+    if (!m_document || !m_activePdfWatchers.isEmpty()
+        || s_pdfRenderWaiters.contains(QPointer<DocumentViewport>(this))) return;
+    // Single-shot zero timer merges paint/input requests in this event turn.
+    // A busy viewport resumes only from completion or shared-slot release.
+    if (m_pdfPreloadTimer && !m_pdfPreloadTimer->isActive()) m_pdfPreloadTimer->start(0);
 }
 
 void DocumentViewport::doAsyncPdfPreload()
 {
-    if (!m_document) {
+    m_pdfPreloadTimer->stop();
+    if (!m_document || m_document->isEdgeless() || m_gesture.isActive()) {
+        withdrawPdfRenderDemand();
         return;
     }
+    if (!m_activePdfWatchers.isEmpty()) {
+        return;
+    }
+
+    updatePdfCacheCapacity();
 
     // Above the whole-page DPI cap a page-level render cannot be shown sharp,
     // and at 300 DPI it is already the most expensive thing we do. Render the
@@ -5652,6 +5635,7 @@ void DocumentViewport::doAsyncPdfPreload()
     
     QVector<int> visible = visiblePages();
     if (visible.isEmpty()) {
+        withdrawPdfRenderDemand();
         return;
     }
     
@@ -5661,10 +5645,16 @@ void DocumentViewport::doAsyncPdfPreload()
     // Pre-load buffer depends on layout mode:
     // - Single column: ±1 page (above and below)
     // - Two column: ±2 pages (1 row above + 1 row below = 4 pages)
-    int preloadBuffer = (m_layoutMode == LayoutMode::TwoColumn) ? 2 : 1;
+    int preloadBuffer = m_scrollActive ? 0 : (m_layoutMode == LayoutMode::TwoColumn ? 2 : 1);
     
     int preloadStart = qMax(0, first - preloadBuffer);
     int preloadEnd = qMin(m_document->pageCount() - 1, last + preloadBuffer);
+
+    // Demand is rebuilt from the current viewport each time a slot is free.
+    // Current content always precedes speculative neighbours.
+    QVector<int> candidates = visible;
+    for (int i = preloadStart; i <= preloadEnd; ++i)
+        if (!visible.contains(i)) candidates.append(i);
     
     qreal dpi = effectivePdfDpi();
     
@@ -5672,11 +5662,11 @@ void DocumentViewport::doAsyncPdfPreload()
     // to its own PDF source so multi-source documents preload the correct backgrounds.
     // renderPageNum is the index the provider actually uses: for a bundled source it
     // is the compact mini-PDF index (via pageMap); otherwise it equals pdfPageNum.
-    struct PreloadItem { QString sourceId; int pdfPageNum; int renderPageNum; QString path; };
+    struct PreloadItem { QString sourceId; int pdfPageNum; int renderPageNum; QString path; int pageIndex; };
     QList<PreloadItem> pagesToPreload;
     {
         QMutexLocker locker(&m_pdfCacheMutex);
-        for (int i = preloadStart; i <= preloadEnd; ++i) {
+        for (int i : candidates) {
             Page* page = m_document->page(i);
             if (!page || page->backgroundType != Page::BackgroundType::PDF) {
                 continue;
@@ -5695,24 +5685,32 @@ void DocumentViewport::doAsyncPdfPreload()
             if (alreadyCached || isPdfPageInFlight(sourceId, pdfPageNum, dpi)) {
                 continue;
             }
+            // A large off-screen neighbour must not bypass the whole-page
+            // budget derived for the currently visible pages.
+            if (!visible.contains(i) && estimatedWholePagePixels(page) > kPdfWholePageMaxPixels)
+                continue;
             
             QString path = m_document->pdfPathForSource(sourceId);
             if (path.isEmpty()) {
-                continue;  // Source unavailable (will render placeholder synchronously)
+                continue;  // Source unavailable (the page background stays visible)
             }
             const int renderPageNum = m_document->resolveSourcePageIndex(sourceId, pdfPageNum);
             if (renderPageNum < 0) {
                 continue;  // Bundled source without this page mapped
             }
-            pagesToPreload.append({ sourceId, pdfPageNum, renderPageNum, path });
+            const QString key = QStringLiteral("page|%1|%2|%3").arg(sourceId).arg(pdfPageNum).arg(dpi, 0, 'g', 17);
+            if (m_failedPdfRequests.contains(key)) continue;
+            pagesToPreload.append({ sourceId, pdfPageNum, renderPageNum, path, i });
+            break;
         }
     }
     
     if (pagesToPreload.isEmpty()) {
+        withdrawPdfRenderDemand();
         return;  // All pages already cached
     }
     
-    // Launch async render for each page that needs caching
+    // Submit the first missing candidate only; completion re-evaluates demand.
     for (const PreloadItem& item : pagesToPreload) {
         const QString sourceId = item.sourceId;
         const int pdfPageNum = item.pdfPageNum;
@@ -5723,6 +5721,12 @@ void DocumentViewport::doAsyncPdfPreload()
         if (isPdfPageInFlight(sourceId, pdfPageNum, dpi)) {
             continue;
         }
+        const QSizeF points = pdfPageSizePt(m_document->page(item.pageIndex));
+        const double pixels = (std::ceil(points.width() * dpi / 72.0) + 2)
+            * (std::ceil(points.height() * dpi / 72.0) + 2);
+        if (!acquirePdfRenderSlot(pixels, item.pageIndex)) return;
+        const auto obsolete = m_pdfRenderObsolete;
+        const QString requestKey = QStringLiteral("page|%1|%2|%3").arg(sourceId).arg(pdfPageNum).arg(dpi, 0, 'g', 17);
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
         m_pdfPagesInFlight.append({sourceId, pdfPageNum, dpi, watcher});
         
@@ -5739,7 +5743,7 @@ void DocumentViewport::doAsyncPdfPreload()
         // The background thread returns QImage, and we convert to QPixmap here
         // in the finished handler which runs on the main thread.
         connect(watcher, &QFutureWatcher<QImage>::finished, this,
-                [this, watcher, sourceId, pdfPageNum, dpi, generation, generationToken]() {
+                [this, watcher, sourceId, pdfPageNum, dpi, generation, generationToken, obsolete, requestKey]() {
             // BUG-A006 FIX: Check if watcher was cancelled (e.g., by invalidatePdfCache)
             // This happens when document/page changes while render is in progress
             m_activePdfWatchers.removeOne(watcher);
@@ -5756,18 +5760,19 @@ void DocumentViewport::doAsyncPdfPreload()
                 pdfImage = watcher->result();
             }
             delete watcher;
+            releasePdfRenderSlot();
+            // This zero-timer runs after insertion below, selecting the next
+            // missing page from the latest view instead of the old batch.
+            preloadPdfCache();
             
-            if (wasCancelled || generation != generationToken->load()) {
-                retryPdfPreloadAfterDiscard();
+            if (wasCancelled || generation != generationToken->load() || obsolete->load()) {
                 return;
             }
             
             // Check if rendering failed
             if (pdfImage.isNull()) {
-                // A settled paint may have deferred to this request. Let the
-                // existing synchronous miss path retry once when it is visible.
-                const QRegion dirty = pdfRepaintRegion(sourceId, pdfPageNum);
-                if (!dirty.isEmpty()) update(dirty);
+                // Do not turn a malformed page into a completion/retry loop.
+                m_failedPdfRequests.insert(requestKey);
                 return;
             }
             
@@ -5831,8 +5836,8 @@ void DocumentViewport::doAsyncPdfPreload()
         // NOTE: QImage is explicitly documented as thread-safe for read operations
         // and can be safely passed between threads.
         QFuture<QImage> future = QtConcurrent::run([renderPageNum, dpi, pdfPath,
-                                                  generation, generationToken]() -> QImage {
-            if (generation != generationToken->load()) {
+                                                  generation, generationToken, obsolete]() -> QImage {
+            if (generation != generationToken->load() || obsolete->load()) {
                 return QImage();
             }
             // Use thread-local cached PDF provider to avoid re-opening the PDF
@@ -5840,7 +5845,7 @@ void DocumentViewport::doAsyncPdfPreload()
             // (keyed by resolved source path).
             ThreadPdfCache& cache = s_threadPdfCache.localData();
             PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-            if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load()) {
+            if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load() || obsolete->load()) {
                 return QImage();  // Return null image on failure
             }
             
@@ -5850,19 +5855,17 @@ void DocumentViewport::doAsyncPdfPreload()
         });
         
         watcher->setFuture(future);
+        return;
     }
-    /*
-    if (!pagesToPreload.isEmpty()) {
-        qDebug() << "PDF async preload: started" << pagesToPreload.size() 
-                 << "background renders for pages" << pagesToPreload;
-    }
-    */
+
 }
 
 void DocumentViewport::cancelAndWaitForBackgroundThreads()
 {
     if (m_pdfPreloadTimer)
         m_pdfPreloadTimer->stop();
+    withdrawPdfRenderDemand();
+    if (m_pdfRenderObsolete) m_pdfRenderObsolete->store(true);
     ++(*m_pdfPageGeneration);
     ++(*m_pdfTileGeneration);
     for (QFutureWatcher<QImage>* watcher : m_activePdfWatchers) {
@@ -5871,6 +5874,7 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
         delete watcher;
     }
     m_activePdfWatchers.clear();
+    releasePdfRenderSlot();
     // All owners have now been joined and deleted, including their callbacks.
     m_pdfPagesInFlight.clear();
     m_pdfTilesInFlight.clear();
@@ -5878,6 +5882,9 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
 
 void DocumentViewport::invalidatePdfCache()
 {
+    m_failedPdfRequests.clear();
+    withdrawPdfRenderDemand();
+    if (m_pdfRenderObsolete) m_pdfRenderObsolete->store(true);
     // Cancel pending async preloads
     if (m_pdfPreloadTimer) {
         m_pdfPreloadTimer->stop();
@@ -5913,6 +5920,10 @@ void DocumentViewport::invalidatePdfCache()
 
 void DocumentViewport::invalidatePdfTileCache()
 {
+    for (auto it = m_failedPdfRequests.begin(); it != m_failedPdfRequests.end();) {
+        if (it->startsWith(QLatin1String("tile|"))) it = m_failedPdfRequests.erase(it);
+        else ++it;
+    }
     // Any zoom step changes the tile DPI, so outstanding requests belong to a
     // regime that is no longer being shown. Bumping the generation is what lets
     // them be dropped instead of being inserted under the old DPI (where they
@@ -5930,6 +5941,7 @@ void DocumentViewport::invalidatePdfTileCache()
 
 void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageIndex)
 {
+    m_failedPdfRequests.clear();
     // Match the single-page tile invalidation rule: queued old content must
     // not be inserted again. Page-scoped epochs can refine this if needed.
     ++(*m_pdfPageGeneration);
@@ -5946,6 +5958,7 @@ void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageI
 
 void DocumentViewport::invalidatePdfTileCachePage(const QString& sourceId, int pageIndex)
 {
+    m_failedPdfRequests.clear();
     // Supersede first: a request for this page that is already rasterising would
     // otherwise pass the generation check and insert the old content again.
     // Coarser than needed (it drops in-flight work for every page), but this is
@@ -20717,18 +20730,14 @@ void DocumentViewport::renderPage(QPainter& painter, Page* page, int pageIndex)
                     if (usesTiledPdfRender()) {
                         // Tiled regime. Draw what is already cached and never
                         // render here: a whole-page render at this zoom cannot be
-                        // sharp and would be enormous. The settle handler renders
-                        // the regions; this path only blits them.
+                        // sharp and would be enormous. The demand scheduler
+                        // fills missing regions; this path only blits them.
                         drawCachedPdfTiles(painter, page, pageIndex, pageRect);
                     } else {
                         qreal dpi = effectivePdfDpi();
-                        // SP2: never render synchronously while scrolling - draw the
-                        // cached pixmap if present, else fall back to the page
-                        // background (already filled above). The settle handler
-                        // renders the final visible pages once scrolling stops.
-                        QPixmap pdfPixmap = isScrolling()
-                            ? lookupCachedPdfPage(page->pdfSourceId, page->pdfPageNumber, dpi)
-                            : getCachedPdfPage(page->pdfSourceId, page->pdfPageNumber, dpi);
+                        // Both moving and settled paints are cache-only. A miss
+                        // schedules current visible demand without a settle delay.
+                        QPixmap pdfPixmap = getCachedPdfPage(page->pdfSourceId, page->pdfPageNumber, dpi);
                         
                         if (!pdfPixmap.isNull()) {
                             // Scale pixmap to fit page rect
@@ -21589,11 +21598,9 @@ void DocumentViewport::drawCachedPdfTiles(QPainter& painter, const Page* page, i
     }
 
     // Self-heal: this path never renders, so the only thing that fills the cache
-    // is the debounced preload. It is normally triggered by scroll/zoom, but a
-    // page can arrive in tiled mode without either (a document opened at a high
-    // zoom, a relayout) -- then nothing would ever ask for a tile and the page
-    // would stay blank. Request one here instead. Only when the timer is idle,
-    // so continuous repaints cannot starve the render.
+    // is the demand scheduler. It is normally triggered by scroll/zoom, but a
+    // page can arrive in tiled mode without either (a high-zoom open or relayout).
+    // The request coalesces with other demand and never restarts a busy timer.
     const QRectF vis = visibleRect().translated(-pagePosition(pageIndex)).intersected(pageRect);
     if (!vis.isEmpty()) {
         bool covered = false;
@@ -21603,9 +21610,7 @@ void DocumentViewport::drawCachedPdfTiles(QPainter& painter, const Page* page, i
                 break;
             }
         }
-        if (!covered && m_pdfPreloadTimer && !m_pdfPreloadTimer->isActive()) {
-            m_pdfPreloadTimer->start(PDF_PRELOAD_DELAY_MS);
-        }
+        if (!covered) preloadPdfCache();
     }
 }
 
@@ -21667,12 +21672,17 @@ void DocumentViewport::prunePdfTiles()
 
 void DocumentViewport::doAsyncPdfTilePreload()
 {
-    if (!m_document) {
+    if (!m_document || m_document->isEdgeless() || m_gesture.isActive()) {
+        withdrawPdfRenderDemand();
+        return;
+    }
+    if (!m_activePdfWatchers.isEmpty()) {
         return;
     }
 
     const QVector<int> visible = visiblePages();
     if (visible.isEmpty()) {
+        withdrawPdfRenderDemand();
         return;
     }
 
@@ -21729,7 +21739,7 @@ void DocumentViewport::doAsyncPdfTilePreload()
             continue;  // Bundled source without this page mapped
         }
 
-        const QString key = QStringLiteral("%1|%2|%3|%4|%5|%6|%7")
+        const QString key = QStringLiteral("tile|%1|%2|%3|%4|%5|%6|%7")
                                 .arg(sourceId)
                                 .arg(pdfPageNum)
                                 .arg(tileDpi, 0, 'g', 17)
@@ -21737,13 +21747,16 @@ void DocumentViewport::doAsyncPdfTilePreload()
                                 .arg(region.yUnits, 0, 'g', 17)
                                 .arg(region.wUnits, 0, 'g', 17)
                                 .arg(region.hUnits, 0, 'g', 17);
-        if (isPdfTileInFlight(key)) {
+        if (isPdfTileInFlight(key) || m_failedPdfRequests.contains(key)) {
             continue;  // A render for exactly this region is already running
         }
-        m_pdfTilesInFlight.insert(key);
-
         const QRectF regionPt(region.xPt, region.yPt, region.wPt, region.hPt);
         const QRectF regionUnits(region.xUnits, region.yUnits, region.wUnits, region.hUnits);
+        const double pixels = (std::ceil(region.wPt * tileDpi / 72.0) + 2)
+            * (std::ceil(region.hPt * tileDpi / 72.0) + 2);
+        if (!acquirePdfRenderSlot(pixels, pageIdx, regionUnits)) return;
+        const auto obsolete = m_pdfRenderObsolete;
+        m_pdfTilesInFlight.insert(key);
 
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
         m_activePdfWatchers.append(watcher);
@@ -21758,7 +21771,7 @@ void DocumentViewport::doAsyncPdfTilePreload()
         // a QImage and the conversion happens here in the finished handler.
         connect(watcher, &QFutureWatcher<QImage>::finished, this,
                 [this, watcher, key, sourceId, pdfPageNum, tileDpi, regionPt, regionUnits,
-                 generation, generationToken]() {
+                 generation, generationToken, obsolete]() {
             m_activePdfWatchers.removeOne(watcher);
             m_pdfTilesInFlight.remove(key);
 
@@ -21768,17 +21781,18 @@ void DocumentViewport::doAsyncPdfTilePreload()
                 tileImage = watcher->result();
             }
             delete watcher;
+            releasePdfRenderSlot();
+            preloadPdfCache();
 
             // Superseded while rendering: the view has moved on (or the zoom
             // changed), so the image describes a state that is no longer wanted.
-            // Dropping it here is the whole of "cancellation" -- MuPDF has no
-            // cooperative cancellation point, so work already inside
-            // fz_run_page() always runs to completion.
-            if (wasCancelled || generation != generationToken->load()) {
-                retryPdfPreloadAfterDiscard();
+            // This integration does not yet interrupt fz_run_page(); an admitted
+            // call already rasterising must finish before its slot is released.
+            if (wasCancelled || generation != generationToken->load() || obsolete->load()) {
                 return;
             }
             if (tileImage.isNull() || !m_document) {
+                if (m_document) m_failedPdfRequests.insert(key);
                 return;
             }
 
@@ -21832,16 +21846,16 @@ void DocumentViewport::doAsyncPdfTilePreload()
 
         // Background thread: rasterise just this region (thread-safe provider).
         QFuture<QImage> future = QtConcurrent::run(
-            [renderPageNum, tileDpi, pdfPath, regionPt, generation, generationToken]() -> QImage {
+            [renderPageNum, tileDpi, pdfPath, regionPt, generation, generationToken, obsolete]() -> QImage {
                 // Bail out before paying for a rasterisation the view no longer
                 // wants. This is the only point where a queued request can be
                 // abandoned for free.
-                if (generation != generationToken->load()) {
+                if (generation != generationToken->load() || obsolete->load()) {
                     return QImage();
                 }
                 ThreadPdfCache& cache = s_threadPdfCache.localData();
                 PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-                if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load()) {
+                if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load() || obsolete->load()) {
                     return QImage();
                 }
                 QImage result = threadPdf->renderPageRegionToImage(renderPageNum, tileDpi, regionPt);
@@ -21849,7 +21863,9 @@ void DocumentViewport::doAsyncPdfTilePreload()
                 return result;
             });
         watcher->setFuture(future);
+        return;
     }
+    withdrawPdfRenderDemand();
 }
 
 

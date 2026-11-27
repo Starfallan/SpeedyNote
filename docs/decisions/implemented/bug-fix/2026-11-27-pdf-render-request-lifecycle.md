@@ -22,6 +22,8 @@ Status: implemented
 
 ## Scope
 
+以下为首步实现的范围记录；后续[可见需求调度](../architecture/2026-11-27-pdf-visible-demand-scheduling.md)替代其中停止后加载、同步 cache miss 和无整体任务上限的行为，其余未覆盖项继续保留。
+
 这是[性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)中减少确定性浪费的第一个可比较改动，不能标记整个第一阶段完成：
 
 - 普通滚动的 120 ms settle 和 150 ms preload 等待仍在；第一次未命中且没有在途任务时仍同步渲染。
@@ -63,4 +65,5 @@ Debug 或 Benchmark 桌面构建提供 `--test-pdf-render-lifecycle REPORT.json`
 
 - [性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)：部分重叠；本篇实现部分请求生命周期规则，整体优化计划仍为 proposed。
 - [Benchmark 决策](../testing/2026-11-27-pdf-benchmark.md)：部分重叠；复用原测量协议，baseline 为 `68ac33a`，不重写已有测量定义。
+- [可见需求调度](../architecture/2026-11-27-pdf-visible-demand-scheduling.md)：后续实施，保留本篇身份规则，改变请求时机和任务上限。
 - [初版审查](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)：部分重叠；共享 generation 和重复预加载的问题在本篇处理，原审查作为基线事实保留。

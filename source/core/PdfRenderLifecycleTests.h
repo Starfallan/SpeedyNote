@@ -72,6 +72,8 @@ class PdfRenderLifecycleTests {
         view.setDocument(document);
         // Deliver the existing deferred auto-fit before fixing the test pose.
         QCoreApplication::processEvents();
+        view.cancelAndWaitForBackgroundThreads();
+        view.invalidatePdfCache();
         view.setZoomLevel(1.0);
         view.setPanOffset(QPointF(0, 0));
         view.m_pdfPreloadTimer->stop();
@@ -233,6 +235,76 @@ class PdfRenderLifecycleTests {
         view.m_gesture.reset();
     }
 
+    static void latestDemand(const QString& path, Checks& c, bool tiled) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport view;
+        prepare(view, document.get());
+        if (tiled) view.setZoomLevel(4.0);
+        view.m_pdfPreloadTimer->stop();
+        WorkerGate gate;
+        if (!gate.ready()) { c.check(false, "worker gate starts"); return; }
+        const QString source = document->page(0)->pdfSourceId;
+        if (!tiled) {
+            c.check(view.getCachedPdfPage(source, 0, view.effectivePdfDpi()).isNull()
+                    && view.m_pdfPreloadTimer->isActive() && view.m_activePdfWatchers.isEmpty(),
+                    "first settled cache miss schedules work without synchronously rendering");
+        }
+        view.doAsyncPdfPreload();
+        c.check(view.m_activePdfWatchers.size() == 1, "one render is admitted per viewport");
+        const auto oldDemand = view.m_pdfRenderObsolete;
+        const QPointF target = view.pagePosition(2);
+        for (int i = 0; i < 40; ++i) {
+            view.setPanOffset(target + QPointF(0, i));
+            view.doAsyncPdfPreload();
+        }
+        view.setPanOffset(target);
+        view.m_scrollSettleTimer->stop(); // Keep scrolling active throughout completion.
+        c.check(view.m_scrollActive && view.m_activePdfWatchers.size() == 1
+                && oldDemand && oldDemand->load(),
+                "rapid scroll keeps one job and marks the off-screen queued request obsolete");
+        gate.release();
+        c.check(waitUntil([&] {
+            return view.m_activePdfWatchers.isEmpty() && !view.m_pdfPreloadTimer->isActive()
+                && (tiled ? !view.lookupCachedPdfTiles(source, 2, view.pdfTileDpi()).isEmpty()
+                          : !view.lookupCachedPdfPage(source, 2, view.effectivePdfDpi()).isNull());
+        }), "latest visible content loads while scrolling is still active");
+        c.check(view.m_scrollActive && view.m_pdfReservedPixels == 0,
+                "progress does not depend on scroll settle and releases pixel reservations");
+        c.check(tiled ? view.lookupCachedPdfTiles(source, 0, view.pdfTileDpi()).isEmpty()
+                      : view.lookupCachedPdfPage(source, 0, view.effectivePdfDpi()).isNull(),
+                "obsolete queued content is not inserted into cache");
+    }
+
+    static void sharedAdmission(const QString& path, Checks& c) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport a, b, d;
+        for (auto* view : {&a, &b, &d}) prepare(*view, document.get());
+        WorkerGate gate;
+        if (!gate.ready()) { c.check(false, "worker gate starts"); return; }
+        for (auto* view : {&a, &b, &d}) view->doAsyncPdfPreload();
+        const int admitted = a.m_activePdfWatchers.size() + b.m_activePdfWatchers.size()
+            + d.m_activePdfWatchers.size();
+        c.check(admitted > 0 && admitted <= 2 && d.m_activePdfWatchers.isEmpty(),
+                "multiple viewports share the process-wide admission bound");
+        // Remove a waiter, then re-register it; a dead queue head must not
+        // strand later viewports, and repeated demand must not duplicate it.
+        d.setDocument(nullptr);
+        d.setDocument(document.get());
+        d.doAsyncPdfPreload();
+        gate.release();
+        c.check(waitUntil([&] {
+            for (auto* view : {&a, &b, &d}) {
+                if (view->m_pdfCache.isEmpty() || !view->m_activePdfWatchers.isEmpty()
+                    || view->m_pdfPreloadTimer->isActive()) return false;
+            }
+            return true;
+        }), "all waiting viewports progress without polling or more user input");
+        c.check(a.m_pdfReservedPixels == 0 && b.m_pdfReservedPixels == 0 && d.m_pdfReservedPixels == 0,
+                "shared admission releases all reservations");
+    }
+
 public:
     static int run(const QString& reportPath) {
         if (reportPath.isEmpty() || QFileInfo::exists(reportPath)) return 2;
@@ -260,6 +332,9 @@ public:
         invalidation(pdfPath, c, true);
         documentSwitchAndShutdown(pdfPath, c);
         repaint(pdfPath, c);
+        latestDemand(pdfPath, c, false);
+        latestDemand(pdfPath, c, true);
+        sharedAdmission(pdfPath, c);
         QSaveFile report(reportPath);
         if (!report.open(QIODevice::WriteOnly)) return 2;
         const QByteArray bytes = QJsonDocument(QJsonObject{{"passed", c.passed}, {"checks", c.results}}).toJson();

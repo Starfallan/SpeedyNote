@@ -47,7 +47,7 @@ public:
     // Logical viewport coordinates of a PDF raster actually sent to QPainter.
     // Future preview paths must report their real DPI through this same hook.
     virtual void pdfDraw(const QRectF& viewportRect, qreal dpi) = 0;
-    // The existing snapshot is shifted in physical pixels, then dirty logical
+    // The existing snapshot is shifted in physical pixels, then dirty physical
     // regions are repainted with the normal layer stack. Hooks bracket draws.
     virtual void panFrameBegin(const QPoint& shift, const QRegion& dirty, qreal dpr) = 0;
     virtual void panFrameEnd() = 0;

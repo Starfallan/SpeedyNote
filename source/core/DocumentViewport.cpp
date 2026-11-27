@@ -5375,8 +5375,8 @@ void DocumentViewport::refreshPanFrame()
     const QPointF targetPan = m_panOffset;
     m_panOffset = m_gesture.startPan;
 
-    // Expand each physical strip to logical pixels. Slight overlap is painted
-    // once with the full layer stack; it cannot leave a fractional-DPR seam.
+    // Logical bounds are only for scene culling. The painter clip stays on
+    // exact physical pixel boundaries, including at fractional display scales.
     QRegion dirty;
     for (const QRect& part : exposed) {
         dirty += QRectF(part.x() / dpr, part.y() / dpr,
@@ -5384,11 +5384,16 @@ void DocumentViewport::refreshPanFrame()
     }
     dirty &= rect();
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
-    if (m_pdfBenchmarkSink) m_pdfBenchmarkSink->panFrameBegin(shift, dirty, dpr);
+    if (m_pdfBenchmarkSink) m_pdfBenchmarkSink->panFrameBegin(shift, exposed, dpr);
 #endif
     {
         QPainter framePainter(&m_gesture.cachedFrame);
-        framePainter.setClipRegion(dirty);
+        framePainter.scale(1 / dpr, 1 / dpr);
+        framePainter.setClipRegion(exposed);
+        framePainter.scale(dpr, dpr);
+        // Clear every clipped physical pixel opaquely. Antialiased fillRect
+        // on a logical dirty edge can blend with stale pixels at 125%/150%.
+        framePainter.fillRect(rect(), m_backgroundColor);
         renderCanvas(framePainter, dirty.boundingRect());
     }
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
@@ -6123,6 +6128,7 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
 
 void DocumentViewport::invalidatePdfCache()
 {
+    schedulePanFrameRefresh(true);
     m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     withdrawPdfRenderDemand();
@@ -6162,7 +6168,9 @@ void DocumentViewport::invalidatePdfCache()
 
 void DocumentViewport::invalidatePdfTileCache()
 {
-    schedulePanFrameRefresh(true);
+    // Ordinary page-cache maintenance also calls this with no tiled content.
+    // Do not turn that housekeeping into a full snapshot repaint on each pan.
+    if (usesTiledPdfRender()) schedulePanFrameRefresh(true);
     for (auto it = m_failedPdfRequests.begin(); it != m_failedPdfRequests.end();) {
         if (it->startsWith(QLatin1String("tile|"))) it = m_failedPdfRequests.erase(it);
         else ++it;

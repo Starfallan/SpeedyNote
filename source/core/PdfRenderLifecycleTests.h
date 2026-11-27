@@ -29,10 +29,31 @@
 class PdfRenderLifecycleTests {
     struct Checks {
         QJsonArray results;
+        QJsonArray diagnostics;
+        QString outputBase;
         bool passed = true;
         void check(bool ok, const char* description) {
             passed &= ok;
             results.append(QJsonObject{{"check", description}, {"passed", ok}});
+        }
+        void compareImages(const QImage& actual, const QImage& expected, const QString& name) {
+            const bool equal = actual == expected;
+            check(equal, qPrintable(name));
+            if (equal) return;
+            const QString prefix = outputBase + QStringLiteral("-image-%1").arg(diagnostics.size());
+            actual.save(prefix + "-actual.png");
+            expected.save(prefix + "-expected.png");
+            int changed = 0, maxDelta = 0;
+            if (actual.size() == expected.size()) {
+                for (int y = 0; y < actual.height(); ++y) for (int x = 0; x < actual.width(); ++x) {
+                    const QColor a = actual.pixelColor(x, y), b = expected.pixelColor(x, y);
+                    if (a != b) ++changed;
+                    maxDelta = qMax(maxDelta, qMax(qAbs(a.red() - b.red()),
+                        qMax(qAbs(a.green() - b.green()), qAbs(a.blue() - b.blue()))));
+                }
+            }
+            diagnostics.append(QJsonObject{{"check", name}, {"image_prefix", prefix},
+                {"changed_pixels", changed}, {"max_channel_delta", maxDelta}});
         }
     };
 
@@ -73,6 +94,8 @@ class PdfRenderLifecycleTests {
         view.resize(640, 360);
         view.setAutoLayoutEnabled(false);
         view.setDocument(document);
+        view.setDarkMode(false);
+        view.setPdfDarkModeEnabled(true);
         // Deliver the existing deferred auto-fit before fixing the test pose.
         QCoreApplication::processEvents();
         view.cancelAndWaitForBackgroundThreads();
@@ -306,8 +329,8 @@ class PdfRenderLifecycleTests {
         view.m_panOffset = view.m_gesture.startPan;
         const QImage expected = canvasImage(view, view.m_gesture.frameDevicePixelRatio);
         view.m_panOffset = actualPan;
-        c.check(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32) == expected,
-                "held snapshot matches normal PDF, ink and object composition");
+        c.compareImages(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32), expected,
+                QStringLiteral("held snapshot matches normal PDF, ink and object composition"));
 
         // Refresh-only invalidation works while the finger remains stationary.
         view.setDarkMode(true);
@@ -373,8 +396,8 @@ class PdfRenderLifecycleTests {
             }
             c.check(aligned && QLineF(view.m_gesture.startPan, origin).length() < .000001,
                     "fractional-DPR round trip preserves origin and bounds subpixel residual");
-            c.check(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32)
-                    == canvasImage(view, dpr), "scrolled strips match a fresh canvas after a round trip");
+            c.compareImages(view.m_gesture.cachedFrame.toImage().convertToFormat(QImage::Format_RGB32),
+                    canvasImage(view, dpr), QStringLiteral("scrolled strips match a fresh canvas at DPR %1").arg(dpr));
             view.resetViewportGesture();
         }
         view.setDocument(nullptr);
@@ -638,13 +661,25 @@ class PdfRenderLifecycleTests {
         d.setDocument(document.get());
         d.doAsyncPdfPreload();
         gate.release();
-        c.check(waitUntil([&] {
+        const bool progressed = waitUntil([&] {
             for (auto* view : {&a, &b, &d}) {
-                if (view->m_pdfCache.isEmpty() || !view->m_activePdfWatchers.isEmpty()
+                // The deferred auto-fit after reattaching d may select tiled
+                // mode on a high-DPR screen; either cache represents progress.
+                if ((view->m_pdfCache.isEmpty() && view->m_pdfTileCache.isEmpty())
+                    || !view->m_activePdfWatchers.isEmpty()
                     || view->m_pdfPreloadTimer->isActive()) return false;
             }
             return true;
-        }), "all waiting viewports progress without polling or more user input");
+        });
+        c.check(progressed, "all waiting viewports progress without polling or more user input");
+        if (!progressed) {
+            for (auto* view : {&a, &b, &d}) {
+                c.diagnostics.append(QJsonObject{{"check", "shared admission"}, {"zoom", view->m_zoomLevel},
+                    {"dpr", view->devicePixelRatioF()}, {"whole", view->m_pdfCache.size()},
+                    {"tiles", view->m_pdfTileCache.size()}, {"pending", view->m_activePdfWatchers.size()},
+                    {"failed_requests", view->m_failedPdfRequests.size()}, {"visible_pages", view->visiblePages().size()}});
+            }
+        }
         c.check(a.m_pdfReservedPixels == 0 && b.m_pdfReservedPixels == 0 && d.m_pdfReservedPixels == 0,
                 "shared admission releases all reservations");
     }
@@ -658,6 +693,7 @@ public:
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temporary.path());
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, temporary.path());
         Checks c;
+        c.outputBase = QFileInfo(reportPath).absoluteFilePath();
         const QString pdfPath = temporary.filePath("pages.pdf");
         {
             QPdfWriter writer(pdfPath);
@@ -704,7 +740,8 @@ public:
         sharedAdmission(pdfPath, c);
         QSaveFile report(reportPath);
         if (!report.open(QIODevice::WriteOnly)) return 2;
-        const QByteArray bytes = QJsonDocument(QJsonObject{{"passed", c.passed}, {"checks", c.results}}).toJson();
+        const QByteArray bytes = QJsonDocument(QJsonObject{{"passed", c.passed}, {"checks", c.results},
+            {"diagnostics", c.diagnostics}}).toJson();
         if (report.write(bytes) != bytes.size() || !report.commit()) return 2;
         return c.passed ? 0 : 1;
     }

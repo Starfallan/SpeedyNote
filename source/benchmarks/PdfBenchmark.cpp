@@ -163,11 +163,10 @@ public:
         if (!recording || !measureCoverage) return;
         updatingFrame = true;
         frameDpr = dpr;
-        const QTransform physical = QTransform::fromScale(dpr, dpr);
         const QRegion bounds(m_gesture.cachedFrame.rect());
         snapshotContent = snapshotContent.translated(shift) & bounds;
         snapshotSharp = snapshotSharp.translated(shift) & bounds;
-        frameDirty = physical.map(dirty) & bounds;
+        frameDirty = dirty & bounds;
         frameDrawn = frameSharp = QRegion();
     }
     void panFrameEnd() override {

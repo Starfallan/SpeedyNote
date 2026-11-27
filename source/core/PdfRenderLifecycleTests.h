@@ -227,7 +227,7 @@ class PdfRenderLifecycleTests {
         const QRegion tileDirty = view.pdfRepaintRegion(source, 0, QRectF(0, 0, 40, 40));
         c.check(!tileDirty.isEmpty() && tileDirty != actual && (tileDirty - actual).isEmpty(),
                 "tile completion restricts repaint to its visible region");
-        view.m_gesture.activeType = ViewportGestureState::Pan;
+        view.m_gesture.activeType = DocumentViewport::ViewportGestureState::Pan;
         view.m_gesture.cachedFrame = QPixmap(8, 8);
         c.check(view.pdfRepaintRegion(source, 0).isEmpty(), "results do not redraw an unchanged gesture snapshot");
         view.m_gesture.reset();

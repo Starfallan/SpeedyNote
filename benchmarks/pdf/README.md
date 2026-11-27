@@ -155,6 +155,17 @@ node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchma
 
 第二步候选提供滚动中的可见需求调度和任务上限，普通整页 miss 不再同步渲染。其测试标签可用 `--label step2`。原生探针和 runner 未修改，可与已有 baseline / step1 对比；先使用 `--case text-scroll --repeat 1` 检查滚动过程中是否出现内容，再测 `real-scroll` / `real-pan`。单视口的 `sampled_max_pending` 应不超过 1，但这是采样值，完整并发约束由手动功能测试检查。手形截图路径未在第二步修改，不能期待 `vector-hand` 的新区域空白因此消失。
 
+第三步候选复用最多两个 worker provider；每个 provider 仅保留一个热点页 display list，构建期间 MuPDF context 分配限额为 32 MiB。深色图片区域提取和像素转换在 worker 完成，离屏但仍有效的已完成图像可以进入现有缓存供回看使用。并发、光栅和图片缓存预算不增加；32 MiB 不代表整个 provider 或进程内存上限。首次构建有成本，复杂页超额会退回直接渲染，需同时比较首屏、空白、CPU 和峰值内存。手形截图的新区域仍不在此步范围内。
+
+复用此前的真实 PDF suite，不重新生成样本。下载第三步包后，在解压根目录运行：
+
+```powershell
+./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory .
+node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchmark/corpus-real/suite.json --out out/pdf-benchmark/step3 --repeat 5 --label step3
+```
+
+`suite.json` 可换为原样本的绝对路径。原生探针和 runner 未改变，优先与 step2 比较 `real-pan`、`vector-pan`、`vector-dark` 的同页移动与回看，再检查 `real-scroll`、`scan-scroll` 和首屏有无退化。单视口 `sampled_max_pending` 仍应不超过 1。下方交替测量命令中的 baseline/candidate 可以分别指向 step2/step3，交替测量比不同时段两次独立测量更能控制后台负载波动。
+
 保留 baseline 完整目录；candidate 放在另一个目录，使用相同语料与测量代码。在同一设备、同一时段交替测量 A/B、B/A，减少运行顺序造成的偏差：
 
 ```powershell
@@ -182,6 +193,16 @@ node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/paired --cand
 
 第二步增加首屏 miss 的异步检查、连续移动后的最新需求、滚动未停止时完成加载，以及多个视口共享提交额度和释放预留的检查。另覆盖重排页面的缓存保留和区域缓存容量耗尽后不重复渲染。它继续使用原有手动入口。
 
+第三步增加缓存与直接区域渲染的像素比较（72/144/384 DPI、分数坐标、旋转页、CropBox 偏移、照片和透明图形）、指令缓存预算拒绝后的直接渲染、有效完成结果离屏再返回，以及 worker 深色处理的图片保留开关和主题失效。仍只使用手动入口；编译成功不能替代这些功能检查或实际设备性能测量。
+
+内存计数器另有不依赖 Qt/MuPDF 的本地 C++17 检查，不加入 Actions。已有 MinGW 工具链时可在仓库根目录执行（输出目录需已存在）：
+
+```powershell
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread source/pdf/PdfCacheAllocatorTests.cpp -o out/pdf-benchmark/pdf-cache-allocator-tests.exe
+if ($LASTEXITCODE -ne 0) { throw 'Allocator test build failed' }
+./out/pdf-benchmark/pdf-cache-allocator-tests.exe
+```
+
 ```powershell
 node --check benchmarks/pdf/bench.mjs
 node --test benchmarks/pdf/bench.test.mjs
@@ -189,4 +210,4 @@ node --test benchmarks/pdf/bench.test.mjs
 
 测试涵盖 PDF xref/压缩流结构与生成确定性、长空白时间积分、回看分段、median/MAD、比较条件、输出不覆盖及失败进程记录。这些测试不能证明 MuPDF 成功读取 PDF，也不能替代原生编译、实际画面检查和 baseline 采集。
 
-相关决策：[性能优先提案](../../docs/decisions/proposed/architecture/2026-11-27-pdf-performance-first.md)、[Benchmark 决策](../../docs/decisions/implemented/testing/2026-11-27-pdf-benchmark.md)。
+相关决策：[性能优先提案](../../docs/decisions/proposed/architecture/2026-11-27-pdf-performance-first.md)、[Benchmark 决策](../../docs/decisions/implemented/testing/2026-11-27-pdf-benchmark.md)、[第三步区域执行复用](../../docs/decisions/implemented/architecture/2026-11-27-pdf-region-work-reuse.md)。

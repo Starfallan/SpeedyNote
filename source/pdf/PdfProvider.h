@@ -342,8 +342,10 @@ public:
      * 
      * This factory method creates the appropriate implementation
      * based on the current platform and available libraries.
+     * cacheRegions enables one budgeted display list for a viewport worker;
+     * other consumers retain the default direct-rendering policy.
      */
-    static std::unique_ptr<PdfProvider> create(const QString& pdfPath);
+    static std::unique_ptr<PdfProvider> create(const QString& pdfPath, bool cacheRegions = false);
     
     /**
      * @brief Check if PDF support is available on this platform.

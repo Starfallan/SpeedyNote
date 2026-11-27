@@ -17,10 +17,12 @@
 
 #include "PdfProvider.h"
 #include <QMutex>
+#include <cstddef>
 
 // Forward declarations for MuPDF types (avoid exposing mupdf headers)
 struct fz_context;
 struct fz_document;
+struct fz_page;
 
 /**
  * @brief PdfProvider implementation using MuPDF.
@@ -36,7 +38,7 @@ public:
      * 
      * Check isValid() after construction to verify the PDF loaded successfully.
      */
-    explicit MuPdfProvider(const QString& pdfPath);
+    explicit MuPdfProvider(const QString& pdfPath, bool cacheRegions = false);
     
     /**
      * @brief Destructor - cleans up MuPDF resources.
@@ -79,6 +81,15 @@ public:
     bool supportsLinks() const override { return true; }
     
 private:
+    friend class PdfRenderLifecycleTests;
+    struct RegionCache;
+    std::unique_ptr<RegionCache> m_regionCache;
+    bool prepareRegionCache(fz_page* page, int pageIndex) const;
+    void clearRegionCache() const;
+    int cachedRegionPage() const;
+    // Context-wide MuPDF allocation ceiling during list recording, including
+    // referenced images/fonts. Qt images and raster allocations are separate.
+    mutable std::size_t m_regionCacheLimit = 32u * 1024u * 1024u;
     /**
      * @brief Get metadata string from PDF.
      * @param key Metadata key (e.g., "info:Title", "info:Author")

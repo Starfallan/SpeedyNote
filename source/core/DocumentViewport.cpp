@@ -40,7 +40,7 @@
 #include "../compat/qt_compat.h"  // Qt5/Qt6 input device shims
 #include <QtMath>     // For qPow
 #include <QtConcurrent>   // For async PDF rendering
-#include <QThreadStorage> // For thread-local PDF provider caching
+#include <array>
 #include <cmath>      // For std::floor, std::ceil
 #include <algorithm>  // For std::remove_if
 #include <limits>
@@ -142,37 +142,81 @@ qint64 DocumentViewport::s_systemClipboardStamp = 0;
 qint64 DocumentViewport::s_internalCopyEchoGuardUntil = 0;
 QByteArray DocumentViewport::s_systemClipboardFingerprint;
 
-// ===== Thread-Local PDF Provider Cache =====
-// 
-// Each thread in the QThreadPool keeps its own cached PdfProvider to avoid
-// re-opening and parsing the PDF file for every page render. This significantly
-// improves scrolling performance for large PDFs.
-//
-// Cache entry: stores the PDF path and the provider instance.
-// When the path changes (different document), the old provider is released
-// and a new one is created for the new document.
-
-struct ThreadPdfCache {
+// Provider ownership follows the two admission slots, not QThreadPool threads.
+// Only the worker holding a slot may touch its provider. Consecutive requests
+// can reuse parsed content even when Qt chooses a different worker thread.
+struct PdfWorkerCache {
     QString pdfPath;
     std::unique_ptr<PdfProvider> provider;
+    std::weak_ptr<const int> identity;
     
-    PdfProvider* getOrCreate(const QString& path) {
-        if (pdfPath != path || !provider || !provider->isValid()) {
-            // Different file or invalid provider - create new one
+    PdfProvider* getOrCreate(const QString& path, const std::shared_ptr<const int>& owner) {
+        if (identity.lock() != owner || pdfPath != path || !provider || !provider->isValid()) {
+            // Release the previous document before opening its replacement so
+            // switching sources does not temporarily retain both contexts.
+            provider.reset();
             pdfPath = path;
-            provider = PdfProvider::create(path);
+            provider = PdfProvider::create(path, true);
+            identity = owner;
         }
         return provider.get();
     }
-    
-    void clear() {
-        pdfPath.clear();
-        provider.reset();
-    }
 };
 
-// Thread-local storage: each worker thread in QThreadPool gets its own cache
-static QThreadStorage<ThreadPdfCache> s_threadPdfCache;
+struct PdfWorkerSlot {
+    bool busy = false; // GUI-thread only, released after the worker is joined.
+    std::weak_ptr<const int> owner;
+    std::shared_ptr<PdfWorkerCache> cache;
+};
+static std::array<PdfWorkerSlot, 2> s_pdfWorkers;
+
+static void ensurePdfWorkerCleanup()
+{
+    // Release providers before process-static MuPDF lock handlers are destroyed.
+    // Viewport shutdown joins outstanding workers before QApplication exits.
+    static QPointer<QObject> cleanup;
+    if (cleanup) return;
+    cleanup = new QObject(QCoreApplication::instance());
+    QObject::connect(cleanup.data(), &QObject::destroyed, [] {
+        for (auto& slot : s_pdfWorkers) slot.cache.reset();
+    });
+}
+
+static QImage renderPdfRequest(const std::shared_ptr<PdfWorkerCache>& cache,
+    const QString& path, const std::shared_ptr<const int>& identity, int page, qreal dpi, const QRectF& region,
+    bool dark, bool skipImages, quint64 generation,
+    const std::shared_ptr<std::atomic<quint64>>& token,
+    const std::shared_ptr<std::atomic<bool>>& obsolete)
+{
+    if (generation != token->load() || obsolete->load()) return {};
+    PdfProvider* provider = cache->getOrCreate(path, identity);
+    if (!provider || !provider->isValid() || generation != token->load() || obsolete->load()) return {};
+    QImage image = region.isEmpty() ? provider->renderPageToImage(page, dpi)
+                                   : provider->renderPageRegionToImage(page, dpi, region);
+    if (generation != token->load()) {
+        provider->trimStore();
+        return {};
+    }
+    if (dark && !image.isNull()) {
+        QVector<QRect> masks;
+        if (!skipImages) {
+            masks = provider->imageRegions(page, dpi);
+            if (!region.isEmpty()) {
+                const QPoint origin(qRound(region.x() * dpi / 72.0), qRound(region.y() * dpi / 72.0));
+                const QRect bounds(QPoint(0, 0), image.size());
+                QVector<QRect> clipped;
+                for (const QRect& mask : masks) {
+                    const QRect part = mask.translated(-origin).intersected(bounds);
+                    if (!part.isEmpty()) clipped.append(part);
+                }
+                masks = std::move(clipped);
+            }
+        }
+        if (generation == token->load()) DarkModeUtils::invertImageLightness(image, masks);
+    }
+    provider->trimStore();
+    return generation == token->load() ? image : QImage();
+}
 
 // GUI-thread admission, shared by all document viewports. Keep the existing
 // worker pool; do not multiply its concurrency or retain a queue of page jobs.
@@ -183,7 +227,7 @@ static double s_pdfReservedPixels = 0;
 static constexpr double kPdfInFlightPixels = 64.0 * 1024.0 * 1024.0;
 static int pdfRenderConcurrency()
 {
-    return qBound(1, QThread::idealThreadCount() / 2, 2);
+    return qBound(1, QThread::idealThreadCount() / 2, int(s_pdfWorkers.size()));
 }
 
 // ===== Constructor & Destructor =====
@@ -5539,6 +5583,19 @@ bool DocumentViewport::acquirePdfRenderSlot(double pixels, int pageIndex, const 
         || (s_pdfActiveRenders > 0 && s_pdfReservedPixels + pixels > kPdfInFlightPixels))
         return false;
     s_pdfRenderWaiters.removeFirst();
+    ensurePdfWorkerCleanup();
+    int chosen = -1;
+    for (int i = 0; i < int(s_pdfWorkers.size()); ++i) {
+        if (s_pdfWorkers[i].busy) continue;
+        if (chosen < 0) chosen = i;
+        if (s_pdfWorkers[i].owner.lock() == m_pdfWorkerIdentity) { chosen = i; break; }
+    }
+    Q_ASSERT(chosen >= 0);
+    auto& slot = s_pdfWorkers[chosen];
+    slot.owner = m_pdfWorkerIdentity;
+    slot.busy = true;
+    if (!slot.cache) slot.cache = std::make_shared<PdfWorkerCache>();
+    m_pdfWorkerSlot = chosen;
     ++s_pdfActiveRenders;
     m_pdfReservedPixels = qMax(1.0, pixels);
     s_pdfReservedPixels += m_pdfReservedPixels;
@@ -5553,6 +5610,8 @@ void DocumentViewport::releasePdfRenderSlot()
 {
     if (m_pdfReservedPixels <= 0) return;
     --s_pdfActiveRenders;
+    s_pdfWorkers[m_pdfWorkerSlot].busy = false;
+    m_pdfWorkerSlot = -1;
     s_pdfReservedPixels = qMax(0.0, s_pdfReservedPixels - m_pdfReservedPixels);
     m_pdfReservedPixels = 0;
     m_pdfRenderPageIndex = -1;
@@ -5781,6 +5840,10 @@ void DocumentViewport::doAsyncPdfPreload()
             * (std::ceil(points.height() * dpi / 72.0) + 2);
         if (!acquirePdfRenderSlot(pixels, item.pageIndex)) return;
         const auto obsolete = m_pdfRenderObsolete;
+        const auto workerCache = s_pdfWorkers[m_pdfWorkerSlot].cache;
+        const auto workerIdentity = m_pdfWorkerIdentity;
+        const bool dark = m_isDarkMode && m_pdfDarkModeEnabled;
+        const bool skipImages = m_skipImageMasking;
         const QString requestKey = QStringLiteral("page|%1|%2|%3").arg(sourceId).arg(pdfPageNum).arg(dpi, 0, 'g', 17);
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
         m_pdfPagesInFlight.append({sourceId, pdfPageNum, dpi, watcher});
@@ -5820,14 +5883,14 @@ void DocumentViewport::doAsyncPdfPreload()
             // missing page from the latest view instead of the old batch.
             preloadPdfCache();
             
-            if (wasCancelled || generation != generationToken->load() || obsolete->load()) {
+            if (wasCancelled || generation != generationToken->load()) {
                 return;
             }
             
             // Check if rendering failed
             if (pdfImage.isNull()) {
                 // Do not turn a malformed page into a completion/retry loop.
-                m_failedPdfRequests.insert(requestKey);
+                if (!obsolete->load()) m_failedPdfRequests.insert(requestKey);
                 return;
             }
             
@@ -5837,18 +5900,16 @@ void DocumentViewport::doAsyncPdfPreload()
             }
 
             // A result can already be cached by another path. Reject it before
-            // image-region extraction, dark conversion and QPixmap allocation.
+            // allocating another QPixmap on the GUI thread.
             if (!lookupCachedPdfPage(sourceId, pdfPageNum, dpi).isNull()) {
                 return;
             }
 
-            // Apply HSL lightness inversion for PDF dark mode
-            if (m_isDarkMode && m_pdfDarkModeEnabled) {
-                QVector<QRect> imgRegions;
-                if (!m_skipImageMasking) {
-                    imgRegions = m_document->pdfImageRegions(sourceId, pdfPageNum, dpi);
-                }
-                DarkModeUtils::invertImageLightness(pdfImage, imgRegions);
+            // Completed off-screen content can serve a later return, but must
+            // not displace current demand or pay for an unusable QPixmap.
+            {
+                QMutexLocker locker(&m_pdfCacheMutex);
+                if (m_pdfCache.size() >= m_pdfCacheCapacity && pdfPageCacheEvictionIndex() < 0) return;
             }
 
             // SAFE: QPixmap::fromImage on main thread
@@ -5885,23 +5946,10 @@ void DocumentViewport::doAsyncPdfPreload()
         // Background thread: render PDF to QImage (thread-safe)
         // NOTE: QImage is explicitly documented as thread-safe for read operations
         // and can be safely passed between threads.
-        QFuture<QImage> future = QtConcurrent::run([renderPageNum, dpi, pdfPath,
-                                                  generation, generationToken, obsolete]() -> QImage {
-            if (generation != generationToken->load() || obsolete->load()) {
-                return QImage();
-            }
-            // Use thread-local cached PDF provider to avoid re-opening the PDF
-            // for every page render. Each thread pool worker caches its own provider
-            // (keyed by resolved source path).
-            ThreadPdfCache& cache = s_threadPdfCache.localData();
-            PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-            if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load() || obsolete->load()) {
-                return QImage();  // Return null image on failure
-            }
-            
-            QImage result = threadPdf->renderPageToImage(renderPageNum, dpi);
-            threadPdf->trimStore();
-            return result;
+        QFuture<QImage> future = QtConcurrent::run([renderPageNum, dpi, pdfPath, workerCache,
+                workerIdentity, dark, skipImages, generation, generationToken, obsolete]() -> QImage {
+            return renderPdfRequest(workerCache, pdfPath, workerIdentity, renderPageNum, dpi, QRectF(),
+                                    dark, skipImages, generation, generationToken, obsolete);
         });
         
         watcher->setFuture(future);
@@ -5925,6 +5973,12 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
     }
     m_activePdfWatchers.clear();
     releasePdfRenderSlot();
+    for (auto& slot : s_pdfWorkers) {
+        if (!slot.busy && (slot.owner.expired() || slot.owner.lock() == m_pdfWorkerIdentity)) {
+            slot.cache.reset();
+            slot.owner.reset();
+        }
+    }
     // All owners have now been joined and deleted, including their callbacks.
     m_pdfPagesInFlight.clear();
     m_pdfTilesInFlight.clear();
@@ -5932,6 +5986,7 @@ void DocumentViewport::cancelAndWaitForBackgroundThreads()
 
 void DocumentViewport::invalidatePdfCache()
 {
+    m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     withdrawPdfRenderDemand();
     if (m_pdfRenderObsolete) m_pdfRenderObsolete->store(true);
@@ -5991,6 +6046,7 @@ void DocumentViewport::invalidatePdfTileCache()
 
 void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageIndex)
 {
+    m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     // Match the single-page tile invalidation rule: queued old content must
     // not be inserted again. Page-scoped epochs can refine this if needed.
@@ -6008,6 +6064,7 @@ void DocumentViewport::invalidatePdfCachePage(const QString& sourceId, int pageI
 
 void DocumentViewport::invalidatePdfTileCachePage(const QString& sourceId, int pageIndex)
 {
+    m_pdfWorkerIdentity = std::make_shared<const int>(0);
     m_failedPdfRequests.clear();
     // Supersede first: a request for this page that is already rasterising would
     // otherwise pass the generation check and insert the old content again.
@@ -21785,6 +21842,10 @@ void DocumentViewport::doAsyncPdfTilePreload()
             * (std::ceil(region.hPt * tileDpi / 72.0) + 2);
         if (!acquirePdfRenderSlot(pixels, pageIdx, regionUnits)) return;
         const auto obsolete = m_pdfRenderObsolete;
+        const auto workerCache = s_pdfWorkers[m_pdfWorkerSlot].cache;
+        const auto workerIdentity = m_pdfWorkerIdentity;
+        const bool dark = m_isDarkMode && m_pdfDarkModeEnabled;
+        const bool skipImages = m_skipImageMasking;
         m_pdfTilesInFlight.insert(key);
 
         QFutureWatcher<QImage>* watcher = new QFutureWatcher<QImage>(this);
@@ -21813,51 +21874,26 @@ void DocumentViewport::doAsyncPdfTilePreload()
             releasePdfRenderSlot();
             preloadPdfCache();
 
-            // Superseded while rendering: the view has moved on (or the zoom
-            // changed), so the image describes a state that is no longer wanted.
-            // This integration does not yet interrupt fz_run_page(); an admitted
-            // call already rasterising must finish before its slot is released.
-            if (wasCancelled || generation != generationToken->load() || obsolete->load()) {
+            // Reject changed content/quality/theme. Scrolling alone keeps a
+            // completed image useful for return visits within the cache budget.
+            // A call already rasterising still finishes before slot release.
+            if (wasCancelled || generation != generationToken->load()) {
                 return;
             }
             if (tileImage.isNull() || !m_document) {
-                if (m_document) m_failedPdfRequests.insert(key);
+                if (m_document && !obsolete->load()) m_failedPdfRequests.insert(key);
                 return;
             }
 
-            // Avoid expensive post-processing for an already supplied region.
+            // Avoid another QPixmap conversion for an already supplied region.
             for (const PdfTileEntry& cached : lookupCachedPdfTiles(sourceId, pdfPageNum, tileDpi)) {
                 if (cached.regionUnits.contains(regionUnits)) return;
             }
 
-            // Dark mode: the backend reports raster-image rectangles relative to
-            // the whole page, so shift and clip them into this tile before the
-            // lightness inversion (otherwise photos inside the region would be
-            // colour-mangled).
-            if (m_isDarkMode && m_pdfDarkModeEnabled) {
-                QVector<QRect> tileRegions;
-                if (!m_skipImageMasking) {
-                    const QVector<QRect> pageRegions =
-                        m_document->pdfImageRegions(sourceId, pdfPageNum, tileDpi);
-                    // pdfImageRegions() runs the page through fz_scale(dpi/72),
-                    // so its rects live in pt->px space, not units->px space.
-                    // The tile origin has to be computed in the same space, or
-                    // the mask shifts whenever Page::size disagrees with the
-                    // provider's own geometry.
-                    const qreal pxPerPoint = tileDpi / 72.0;
-                    const int originX = qRound(regionPt.x() * pxPerPoint);
-                    const int originY = qRound(regionPt.y() * pxPerPoint);
-                    const QRect tileBounds(QPoint(0, 0), tileImage.size());
-                    tileRegions.reserve(pageRegions.size());
-                    for (const QRect& region : pageRegions) {
-                        const QRect clipped =
-                            region.translated(-originX, -originY).intersected(tileBounds);
-                        if (!clipped.isEmpty()) {
-                            tileRegions.append(clipped);
-                        }
-                    }
-                }
-                DarkModeUtils::invertImageLightness(tileImage, tileRegions);
+            {
+                QMutexLocker locker(&m_pdfTileCacheMutex);
+                if (m_pdfTileCache.size() >= qMax(1, m_pdfTileCacheCapacity)
+                    && pdfTileCacheEvictionIndex() < 0) return;
             }
 
             PdfTileEntry entry;
@@ -21875,21 +21911,10 @@ void DocumentViewport::doAsyncPdfTilePreload()
 
         // Background thread: rasterise just this region (thread-safe provider).
         QFuture<QImage> future = QtConcurrent::run(
-            [renderPageNum, tileDpi, pdfPath, regionPt, generation, generationToken, obsolete]() -> QImage {
-                // Bail out before paying for a rasterisation the view no longer
-                // wants. This is the only point where a queued request can be
-                // abandoned for free.
-                if (generation != generationToken->load() || obsolete->load()) {
-                    return QImage();
-                }
-                ThreadPdfCache& cache = s_threadPdfCache.localData();
-                PdfProvider* threadPdf = cache.getOrCreate(pdfPath);
-                if (!threadPdf || !threadPdf->isValid() || generation != generationToken->load() || obsolete->load()) {
-                    return QImage();
-                }
-                QImage result = threadPdf->renderPageRegionToImage(renderPageNum, tileDpi, regionPt);
-                threadPdf->trimStore();
-                return result;
+            [renderPageNum, tileDpi, pdfPath, regionPt, workerCache, workerIdentity, dark, skipImages,
+                generation, generationToken, obsolete]() -> QImage {
+                return renderPdfRequest(workerCache, pdfPath, workerIdentity, renderPageNum, tileDpi, regionPt,
+                                        dark, skipImages, generation, generationToken, obsolete);
             });
         watcher->setFuture(future);
         return;

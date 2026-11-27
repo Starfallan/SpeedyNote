@@ -4014,6 +4014,8 @@ private:
     int m_pdfRenderPageIndex = -1;
     QRectF m_pdfRenderRegion;
     double m_pdfReservedPixels = 0;
+    int m_pdfWorkerSlot = -1;
+    std::shared_ptr<const int> m_pdfWorkerIdentity = std::make_shared<const int>(0);
     std::shared_ptr<std::atomic<bool>> m_pdfRenderObsolete;
     QSet<QString> m_failedPdfRequests;  ///< Retry only after explicit demand changes
 

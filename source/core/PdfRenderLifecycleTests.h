@@ -4,6 +4,8 @@
 // The worker pool gate makes duplicate/invalidation races deterministic. No
 // QtTest or visible window is required; this is NOT a performance test.
 #include "DocumentViewport.h"
+#include "DarkModeUtils.h"
+#include "../pdf/MuPdfProvider.h"
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -343,6 +345,138 @@ class PdfRenderLifecycleTests {
         }
     }
 
+    static void regionReuse(const QString& path, Checks& c) {
+        MuPdfProvider direct(path), cached(path, true);
+        for (int page : {0, 0, 1, 2, 0}) {
+            for (qreal dpi : {72.0, 144.0, 384.0}) {
+                for (const QRectF& region : {QRectF(0, 0, 120, 100), QRectF(20.25, 30.5, 200, 150)}) {
+                    const QImage expected = direct.renderPageRegionToImage(page, dpi, region);
+                    const QImage actual = cached.renderPageRegionToImage(page, dpi, region);
+                    c.check(!actual.isNull() && actual == expected, "cached region pixels match direct rendering");
+                    c.check(cached.cachedRegionPage() == page, "one display list tracks the requested source page");
+                    c.check(cached.imageRegions(page, dpi) == direct.imageRegions(page, dpi),
+                            "display-list image masks match direct page masks");
+                    cached.trimStore();
+                    c.check(cached.cachedRegionPage() == page, "small display list survives store trimming");
+                }
+            }
+        }
+        cached.clearRegionCache();
+        cached.m_regionCacheLimit = 1; // Existing context already exceeds this.
+        const QRectF region(0, 0, 120, 100);
+        const QImage expected = direct.renderPageRegionToImage(0, 144, region);
+        for (int n = 0; n < 2; ++n) {
+            const QImage actual = cached.renderPageRegionToImage(0, 144, region);
+            c.check(!actual.isNull() && actual == expected && cached.cachedRegionPage() < 0,
+                    "cache budget rejection preserves the direct render path");
+        }
+        cached.m_regionCacheLimit = 32u * 1024u * 1024u;
+        cached.renderPageRegionToImage(1, 72, region);
+        c.check(cached.cachedRegionPage() == 1, "another page can cache after rejection");
+        cached.renderPageToImage(0, 72);
+        c.check(cached.cachedRegionPage() < 0, "whole-page mode releases the region list");
+    }
+
+    static bool writeGeometryPdf(const QString& path) {
+        // QPdfWriter normalizes page geometry. Explicit PDF boxes/rotation
+        // exercise MuPDF's transformed page space and fractional clip edges.
+        const QByteArray content = "0.2 0.6 0.8 rg -50 -30 400 530 re f\n"
+            "1 0 0 RG 3.5 w -40 -20 m 330 470 l S\n"
+            "0 1 0 RG 0.4 w 20 400 m 100 80 250 350 300 20 c S\n";
+        QVector<QByteArray> objects{
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Count 3 /Kids [4 0 R 5 0 R 6 0 R] >>",
+            QByteArray("<< /Length ") + QByteArray::number(qint64(content.size())) + ">>\nstream\n"
+                + content + "endstream"};
+        for (int rotation : {0, 90, 270}) {
+            objects.append(QByteArray("<< /Type /Page /Parent 2 0 R /MediaBox [-50 -30 350 500] "
+                "/CropBox [-25 -15 310 450] /Rotate ") + QByteArray::number(rotation)
+                + " /Resources << >> /Contents 3 0 R >>");
+        }
+        QByteArray bytes("%PDF-1.4\n");
+        QByteArray table("0000000000 65535 f \n");
+        for (int i = 0; i < objects.size(); ++i) {
+            table += QByteArray::number(qint64(bytes.size())).rightJustified(10, '0') + " 00000 n \n";
+            bytes += QByteArray::number(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+        }
+        const auto xref = bytes.size();
+        bytes += "xref\n0 7\n" + table + "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n"
+            + QByteArray::number(qint64(xref)) + "\n%%EOF\n";
+        QSaveFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit();
+    }
+
+    static void completedResultReuse(const QString& path, Checks& c, bool tiled) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport view;
+        prepare(view, document.get());
+        if (tiled) view.setZoomLevel(4.0);
+        const QPointF origin = view.panOffset();
+        view.doAsyncPdfPreload();
+        if (view.m_activePdfWatchers.size() != 1) { c.check(false, "completed reuse job admitted"); return; }
+        auto* watcher = view.m_activePdfWatchers.first();
+        watcher->waitForFinished(); // Leave the GUI callback undelivered.
+        view.setPanOffset(view.pagePosition(2));
+        view.m_scrollSettleTimer->stop();
+        QCoreApplication::sendPostedEvents(watcher);
+        const QString source = document->page(0)->pdfSourceId;
+        c.check(tiled ? !view.lookupCachedPdfTiles(source, 0, view.pdfTileDpi()).isEmpty()
+                      : !view.lookupCachedPdfPage(source, 0, view.effectivePdfDpi()).isNull(),
+                "completed valid content survives moving off-screen before its callback");
+        view.setPanOffset(origin);
+        view.m_scrollSettleTimer->stop();
+        view.doAsyncPdfPreload();
+        c.check(view.m_activePdfWatchers.isEmpty(), "return to completed content needs no second render");
+    }
+
+    static void workerDarkMode(const QString& path, Checks& c, bool tiled, bool skipImages) {
+        auto document = open(path, c);
+        if (!document) return;
+        DocumentViewport view;
+        prepare(view, document.get());
+        view.setPdfDarkModeEnabled(true);
+        view.setDarkMode(true);
+        view.setSkipImageMasking(skipImages);
+        if (tiled) view.setZoomLevel(4.0);
+        view.doAsyncPdfPreload();
+        if (view.m_activePdfWatchers.size() != 1) { c.check(false, "dark worker job admitted"); return; }
+        auto* watcher = view.m_activePdfWatchers.first();
+        watcher->waitForFinished();
+        const QImage actual = watcher->result();
+        MuPdfProvider reference(path);
+        const qreal dpi = tiled ? view.pdfTileDpi() : view.effectivePdfDpi();
+        QRectF region;
+        if (tiled) {
+            const auto tile = view.pdfTileRegionForPage(document->page(0), 0);
+            region = QRectF(tile.xPt, tile.yPt, tile.wPt, tile.hPt);
+        }
+        QImage expected = tiled ? reference.renderPageRegionToImage(0, dpi, region)
+                                : reference.renderPageToImage(0, dpi);
+        auto masks = reference.imageRegions(0, dpi);
+        if (tiled) {
+            QVector<QRect> clipped;
+            for (const QRect& mask : masks) {
+                const QRect part = mask.translated(-qRound(region.x() * dpi / 72.0),
+                    -qRound(region.y() * dpi / 72.0)).intersected(expected.rect());
+                if (!part.isEmpty()) clipped.append(part);
+            }
+            masks = clipped;
+        }
+        c.check(!masks.isEmpty(), "dark worker sample contains a raster image");
+        if (skipImages) masks.clear();
+        DarkModeUtils::invertImageLightness(expected, masks);
+        c.check(!actual.isNull() && actual == expected,
+                "worker returns final dark pixels respecting the image-mask setting before GUI callback");
+        // A completed image waiting for delivery is still stale after a theme
+        // change, even though moving off-screen alone now allows its reuse.
+        view.setDarkMode(false);
+        QCoreApplication::sendPostedEvents(watcher);
+        c.check(view.m_pdfCache.isEmpty() && view.m_pdfTileCache.isEmpty(),
+                "theme change rejects a completed dark image before cache insertion");
+        view.cancelAndWaitForBackgroundThreads();
+    }
+
     static void sharedAdmission(const QString& path, Checks& c) {
         auto document = open(path, c);
         if (!document) return;
@@ -391,6 +525,13 @@ public:
                 if (page) c.check(writer.newPage(), "PDF writer creates another page");
                 painter.fillRect(0, 0, writer.width(), writer.height(), Qt::white);
                 painter.drawText(QPoint(30, 50), QStringLiteral("PDF lifecycle page %1").arg(page));
+                QImage photo(32, 32, QImage::Format_RGB32);
+                photo.fill(QColor(90, 120, 150));
+                painter.drawImage(QRect(10, 10, 64, 48), photo);
+                painter.save();
+                painter.setOpacity(0.4);
+                painter.fillRect(QRect(95, 75, 65, 40), Qt::red);
+                painter.restore();
             }
             c.check(painter.end(), "PDF painter finishes");
         }
@@ -403,6 +544,17 @@ public:
         latestDemand(pdfPath, c, true);
         cacheRetention(pdfPath, c, false);
         cacheRetention(pdfPath, c, true);
+        regionReuse(pdfPath, c);
+        const QString geometryPath = temporary.filePath("geometry.pdf");
+        const bool geometryWritten = writeGeometryPdf(geometryPath);
+        c.check(geometryWritten, "writes rotated/cropped PDF for region comparisons");
+        if (geometryWritten) regionReuse(geometryPath, c);
+        completedResultReuse(pdfPath, c, false);
+        completedResultReuse(pdfPath, c, true);
+        workerDarkMode(pdfPath, c, false, false);
+        workerDarkMode(pdfPath, c, true, false);
+        workerDarkMode(pdfPath, c, false, true);
+        workerDarkMode(pdfPath, c, true, true);
         sharedAdmission(pdfPath, c);
         QSaveFile report(reportPath);
         if (!report.open(QIODevice::WriteOnly)) return 2;

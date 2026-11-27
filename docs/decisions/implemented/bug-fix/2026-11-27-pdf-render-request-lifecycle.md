@@ -24,6 +24,8 @@ Status: implemented
 
 以下为首步实现的范围记录；后续[可见需求调度](../architecture/2026-11-27-pdf-visible-demand-scheduling.md)替代其中停止后加载、同步 cache miss 和无整体任务上限的行为，其余未覆盖项继续保留。
 
+[区域执行复用](../architecture/2026-11-27-pdf-region-work-reuse.md)继续调整深色处理和 provider 保留策略：转换在 worker 完成，provider 随两个共享工作位置复用并按内容身份重建；本篇的 generation 和 watcher 所有权规则继续保留。
+
 这是[性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)中减少确定性浪费的第一个可比较改动，不能标记整个第一阶段完成：
 
 - 普通滚动的 120 ms settle 和 150 ms preload 等待仍在；第一次未命中且没有在途任务时仍同步渲染。

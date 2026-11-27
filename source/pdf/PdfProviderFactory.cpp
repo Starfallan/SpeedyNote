@@ -19,9 +19,9 @@
 // Factory Methods
 // ============================================================================
 
-std::unique_ptr<PdfProvider> PdfProvider::create(const QString& pdfPath)
+std::unique_ptr<PdfProvider> PdfProvider::create(const QString& pdfPath, bool cacheRegions)
 {
-    auto provider = std::make_unique<MuPdfProvider>(pdfPath);
+    auto provider = std::make_unique<MuPdfProvider>(pdfPath, cacheRegions);
     if (provider->isValid()) {
         return provider;
     }

@@ -109,6 +109,7 @@ Status: proposed
 
 ## Related records
 
+- [区域执行复用](../../implemented/architecture/2026-11-27-pdf-region-work-reuse.md)：实现后台深色处理、两个热点 provider 及有限 display list、有效离屏完成结果复用。尚需 step3 性能实测，本篇整体性能目标仍为 proposed。
 - [初版审查与提案](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)：实施优先级已被替代，转 rejected；保留其八项代码证据、原选项理由和外部接口验证限制，避免未来再次无条件引入重复预览工作。不是 implemented 记录，不进入归档。
 - [Qt5 并发修复记录](../../../QT5_BACKPORT_BUG_TRACKING.md)：部分重叠；MuPDF 锁约束继续适用。
 - [Android 生命周期修复记录](../../../ANDROID_BUG_TRACKING.md)：部分重叠；异步文档切换保护继续适用。

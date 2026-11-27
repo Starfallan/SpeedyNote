@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "MuPdfProvider.h"
+#include "PdfCacheAllocator.h"
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
 #include "../benchmarks/PdfBenchmarkSupport.h"
 #endif
@@ -27,13 +28,23 @@
 
 static constexpr size_t SN_MUPDF_STORE_MAX = 32 << 20; // 32 MiB
 
-MuPdfProvider::MuPdfProvider(const QString& pdfPath)
+struct MuPdfProvider::RegionCache {
+    PdfCacheAllocator allocator;
+    fz_display_list* list = nullptr;
+    int pageIndex = -1;
+    int rejectedPage = -1;
+};
+
+MuPdfProvider::MuPdfProvider(const QString& pdfPath, bool cacheRegions)
     : m_path(pdfPath)
 {
     // Create MuPDF context. BUG-Q003: the shared lock handlers are mandatory —
     // MuPDF's OpenJPEG/HarfBuzz/FreeType globals are only safe when every
     // context in the process serialises through the same mutexes.
-    m_ctx = fz_new_context(nullptr, snMuPdfLocks(), SN_MUPDF_STORE_MAX);
+    if (cacheRegions) m_regionCache = std::make_unique<RegionCache>();
+    fz_alloc_context allocator = {m_regionCache ? &m_regionCache->allocator : nullptr,
+        PdfCacheAllocator::allocate, PdfCacheAllocator::reallocate, PdfCacheAllocator::release};
+    m_ctx = fz_new_context(m_regionCache ? &allocator : nullptr, snMuPdfLocks(), SN_MUPDF_STORE_MAX);
     if (!m_ctx) {
         qWarning() << "MuPdfProvider: Failed to create MuPDF context";
         return;
@@ -79,6 +90,7 @@ MuPdfProvider::MuPdfProvider(const QString& pdfPath)
 
 MuPdfProvider::~MuPdfProvider()
 {
+    clearRegionCache();
     if (m_doc) {
         fz_drop_document(m_ctx, m_doc);
         m_doc = nullptr;
@@ -317,6 +329,59 @@ void pixmapToQImageInto(fz_context* ctx, fz_pixmap* pix, QImage& out)
 
 } // namespace
 
+int MuPdfProvider::cachedRegionPage() const
+{
+    return m_regionCache ? m_regionCache->pageIndex : -1;
+}
+
+void MuPdfProvider::clearRegionCache() const
+{
+    if (!m_regionCache) return;
+    if (m_regionCache->list) fz_drop_display_list(m_ctx, m_regionCache->list);
+    m_regionCache->list = nullptr;
+    m_regionCache->pageIndex = -1;
+}
+
+bool MuPdfProvider::prepareRegionCache(fz_page* page, int pageIndex) const
+{
+    if (!m_regionCache) return false;
+    if (m_regionCache->list && m_regionCache->pageIndex == pageIndex) return true;
+    clearRegionCache();
+    if (m_regionCache->rejectedPage == pageIndex) return false;
+    m_regionCache->rejectedPage = pageIndex;
+    if (m_regionCache->allocator.bytes() >= m_regionCacheLimit) return false;
+    fz_display_list* list = nullptr;
+    fz_device* device = nullptr;
+    fz_var(list);
+    fz_var(device);
+    m_regionCache->allocator.limit(m_regionCacheLimit);
+    fz_try(m_ctx) {
+        list = fz_new_display_list(m_ctx, fz_bound_page(m_ctx, page));
+        device = fz_new_list_device(m_ctx, list);
+        fz_cookie cookie = {};
+        fz_run_page(m_ctx, page, device, fz_identity, &cookie);
+        fz_close_device(m_ctx, device);
+        // Some interpreters recover from allocation errors. Never cache a
+        // partial list, even if fz_run_page returned without throwing.
+        if (!m_regionCache->allocator.rejected() && !cookie.errors && !cookie.incomplete) {
+            m_regionCache->list = list;
+            list = nullptr;
+            m_regionCache->pageIndex = pageIndex;
+            m_regionCache->rejectedPage = -1;
+        }
+    }
+    fz_always(m_ctx) {
+        m_regionCache->allocator.unlimit();
+        fz_drop_device(m_ctx, device);
+        fz_drop_display_list(m_ctx, list);
+    }
+    fz_catch(m_ctx) {
+        // A failed/budget-exceeding recording must not blank a renderable page.
+        // Consecutive requests for this page skip another recording attempt.
+    }
+    return m_regionCache->list != nullptr;
+}
+
 QImage MuPdfProvider::renderPageToImage(int pageIndex, qreal dpi) const
 {
 #ifdef SPEEDYNOTE_PDF_BENCHMARK
@@ -326,6 +391,7 @@ QImage MuPdfProvider::renderPageToImage(int pageIndex, qreal dpi) const
     // This is especially important on Android where main thread sync renders can
     // overlap with background async renders (BUG-A006)
     QMutexLocker locker(&m_mutex);
+    clearRegionCache(); // Whole-page requests do not need a region display list.
     
     if (!isValid() || pageIndex < 0 || pageIndex >= m_pageCount) {
         return QImage();
@@ -344,6 +410,9 @@ QImage MuPdfProvider::renderPageToImage(int pageIndex, qreal dpi) const
     fz_pixmap* pix = nullptr;
     fz_device* dev = nullptr;
     QImage result;
+    fz_var(page);
+    fz_var(pix);
+    fz_var(dev);
     
     fz_try(m_ctx) {
         // Load page
@@ -438,6 +507,9 @@ QImage MuPdfProvider::renderPageRegionToImage(int pageIndex, qreal dpi,
     fz_pixmap* pix = nullptr;
     fz_device* dev = nullptr;
     QImage result;
+    fz_var(page);
+    fz_var(pix);
+    fz_var(dev);
 
     fz_try(m_ctx) {
         page = fz_load_page(m_ctx, m_doc, pageIndex);
@@ -475,6 +547,8 @@ QImage MuPdfProvider::renderPageRegionToImage(int pageIndex, qreal dpi,
             fz_throw(m_ctx, FZ_ERROR_GENERIC, "Region exceeds the raster budget");
         }
 
+        const bool cached = prepareRegionCache(page, pageIndex);
+
         pix = fz_new_pixmap_with_bbox(m_ctx, fz_device_bgr(m_ctx), bbox, nullptr, 1);
         if (!pix) {
             fz_throw(m_ctx, FZ_ERROR_GENERIC, "Failed to create pixmap");
@@ -485,7 +559,16 @@ QImage MuPdfProvider::renderPageRegionToImage(int pageIndex, qreal dpi,
         if (!dev) {
             fz_throw(m_ctx, FZ_ERROR_GENERIC, "Failed to create draw device");
         }
-        fz_run_page(m_ctx, page, dev, fz_identity, nullptr);
+        if (cached) {
+            // Replay uses identity; therefore scissor is in original page
+            // coordinates too. The draw device applies ctm exactly once.
+            const float margin = 1.0f / scale;
+            const fz_rect scissor = fz_make_rect(clip.x0 - margin, clip.y0 - margin,
+                                                clip.x1 + margin, clip.y1 + margin);
+            fz_run_display_list(m_ctx, m_regionCache->list, dev, fz_identity, scissor, nullptr);
+        } else {
+            fz_run_page(m_ctx, page, dev, fz_identity, nullptr);
+        }
         fz_close_device(m_ctx, dev);
         fz_drop_device(m_ctx, dev);
         dev = nullptr;
@@ -518,6 +601,11 @@ void MuPdfProvider::trimStore() const
     QMutexLocker locker(&m_mutex);
     if (m_ctx) {
         fz_shrink_store(m_ctx, 0);
+        if (m_regionCache && m_regionCache->list
+            && m_regionCache->allocator.bytes() > m_regionCacheLimit) {
+            m_regionCache->rejectedPage = m_regionCache->pageIndex;
+            clearRegionCache();
+        }
     }
 }
 
@@ -572,8 +660,13 @@ QVector<QRect> MuPdfProvider::imageRegions(int pageIndex, qreal dpi) const
 
     fz_device* dev = nullptr;
 
+    fz_var(page);
+    fz_var(dev);
+
     fz_try(ctx) {
-        page = fz_load_page(ctx, m_doc, pageIndex);
+        const bool cached = m_regionCache && m_regionCache->list
+            && m_regionCache->pageIndex == pageIndex;
+        if (!cached) page = fz_load_page(ctx, m_doc, pageIndex);
 
         // Create a lightweight device that only records image positions
         ImageCollector* collector =
@@ -583,7 +676,10 @@ QVector<QRect> MuPdfProvider::imageRegions(int pageIndex, qreal dpi) const
         collector->rects = &result;
 
         dev = &collector->super;
-        fz_run_page(ctx, page, dev, ctm, nullptr);
+        if (cached)
+            fz_run_display_list(ctx, m_regionCache->list, dev, ctm, fz_infinite_rect, nullptr);
+        else
+            fz_run_page(ctx, page, dev, ctm, nullptr);
         fz_close_device(ctx, dev);
     }
     fz_always(ctx) {

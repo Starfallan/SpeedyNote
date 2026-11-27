@@ -54,12 +54,13 @@ Status: implemented
 
 普通快速滚动从“多数经过页根本没渲染”变成“途中可以提供内容”，CPU 总工作量可能高于此前，不能要求空白显著下降同时无条件保持原来只绘制首尾的调用数。需要一起检查空白积分、CPU、延迟长尾和峰值内存。
 
-全局线程池中的其他任务仍可能延迟 PDF；执行中 MuPDF 不能在本次实现中中断；provider 打开、页面几何查询、主线程深色转换和 QPixmap 转换未全部优化。全应用资源预算和截图增量合成仍属于后续工作。
+全局线程池中的其他任务仍可能延迟 PDF；执行中 MuPDF 不能在本次实现中中断；provider 打开、页面几何查询和 QPixmap 转换未全部优化。深色转换与热点解析复用由[区域执行复用](2026-11-27-pdf-region-work-reuse.md)继续处理。全应用资源预算和截图增量合成仍属于后续工作。
 
 ## Related records
 
 检索活跃 PDF / benchmark 记录后的分类：
 
+- [区域执行复用](2026-11-27-pdf-region-work-reuse.md)：部分重叠；保留本篇调度和任务上限，允许完成后离屏但身份有效的结果进入原有缓存，并把深色处理移到 worker。未开始的离屏任务仍跳过。
 - [首步请求生命周期](../bug-fix/2026-11-27-pdf-render-request-lifecycle.md)：部分重叠；保留身份及失效规则，本篇替代其同步 cache miss 与停止后加载行为。
 - [性能优先提案](../../proposed/architecture/2026-11-27-pdf-performance-first.md)：部分重叠；本篇实现其部分可见需求调度，整体阶段仍未完成。
 - [Benchmark](../testing/2026-11-27-pdf-benchmark.md)：部分重叠；保持探针与比较协议。

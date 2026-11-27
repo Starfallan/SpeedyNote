@@ -4344,6 +4344,10 @@ private:
     void withdrawPdfRenderDemand();
     void discardOffscreenPdfRequest();
     static void wakePdfRenderWaiters();
+    // Call with the respective cache mutex locked. Preserve one cached result
+    // per current demand; -1 means every slot is needed by the current view.
+    int pdfPageCacheEvictionIndex() const;
+    int pdfTileCacheEvictionIndex() const;
 
     // ===== High-DPI tiled PDF rendering =====
     // Above kPdfDpiCap the whole page is never rendered at screen DPI; instead
@@ -4409,7 +4413,7 @@ private:
     /// Async-render the regions the visible pages need (tiled mode only).
     void doAsyncPdfTilePreload();
 
-    /// Insert a freshly rendered tile (main thread), with smart eviction.
+    /// Insert a freshly rendered tile without evicting current visible coverage.
     void insertPdfTile(const PdfTileEntry& entry);
 
     /// Drop tiles that cannot serve the current zoom (frees memory on zoom change).
@@ -4471,7 +4475,7 @@ private:
      * @brief Update cache capacity based on visible pages and layout mode.
      * 
      * Capacity = visible_pages + buffer (3 for 1-column, 6 for 2-column).
-     * If capacity decreases, immediately evicts furthest entries.
+     * If capacity decreases, immediately evicts entries outside current demand.
      */
     void updatePdfCacheCapacity();
 
@@ -4484,12 +4488,11 @@ private:
     void updatePdfTileCacheCapacity();
     
     /**
-     * @brief Evict furthest cache entries until within capacity.
+     * @brief Trim page entries outside current demand until within capacity.
      * 
      * Must be called with m_pdfCacheMutex locked.
-     * Evicts pages furthest from m_currentPageIndex first.
      */
-    void evictFurthestCacheEntries();
+    void trimPdfPageCache();
     
     /**
      * @brief Invalidate page layout cache - call when pages added/removed/resized.

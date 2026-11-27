@@ -5612,6 +5612,57 @@ void DocumentViewport::preloadPdfCache()
     if (m_pdfPreloadTimer && !m_pdfPreloadTimer->isActive()) m_pdfPreloadTimer->start(0);
 }
 
+int DocumentViewport::pdfPageCacheEvictionIndex() const
+{
+    QSet<int> needed;
+    const QVector<int> visible = visiblePages();
+    if (m_document && !visible.isEmpty()) {
+        const int buffer = m_scrollActive ? 0 : (m_layoutMode == LayoutMode::TwoColumn ? 2 : 1);
+        const int first = qMax(0, visible.first() - buffer);
+        const int last = qMin(m_document->pageCount() - 1, visible.last() + buffer);
+        const qreal dpi = effectivePdfDpi();
+        for (int pageIndex = first; pageIndex <= last; ++pageIndex) {
+            const Page* page = m_document->page(pageIndex);
+            if (!page || page->backgroundType != Page::BackgroundType::PDF) continue;
+            for (int i = 0; i < m_pdfCache.size(); ++i) {
+                if (m_pdfCache[i].matches(page->pdfSourceId, page->pdfPageNumber, dpi)) {
+                    needed.insert(i);
+                    break;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < m_pdfCache.size(); ++i)
+        if (!needed.contains(i)) return i;
+    return -1;
+}
+
+int DocumentViewport::pdfTileCacheEvictionIndex() const
+{
+    QSet<int> needed;
+    const qreal dpi = pdfTileDpi();
+    if (m_document) {
+        for (int pageIndex : visiblePages()) {
+            const Page* page = m_document->page(pageIndex);
+            if (!page || page->backgroundType != Page::BackgroundType::PDF) continue;
+            const QRectF visible = visibleRect().translated(-pagePosition(pageIndex))
+                .intersected(QRectF(QPointF(0, 0), page->size));
+            if (visible.isEmpty()) continue;
+            for (int i = 0; i < m_pdfTileCache.size(); ++i) {
+                const PdfTileEntry& tile = m_pdfTileCache[i];
+                if (tile.matches(page->pdfSourceId, page->pdfPageNumber, dpi)
+                    && tile.regionUnits.contains(visible)) {
+                    needed.insert(i);
+                    break;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < m_pdfTileCache.size(); ++i)
+        if (!needed.contains(i)) return i;
+    return -1;
+}
+
 void DocumentViewport::doAsyncPdfPreload()
 {
     m_pdfPreloadTimer->stop();
@@ -5666,6 +5717,10 @@ void DocumentViewport::doAsyncPdfPreload()
     QList<PreloadItem> pagesToPreload;
     {
         QMutexLocker locker(&m_pdfCacheMutex);
+        if (m_pdfCache.size() >= m_pdfCacheCapacity && pdfPageCacheEvictionIndex() < 0) {
+            withdrawPdfRenderDemand();
+            return;
+        }
         for (int i : candidates) {
             Page* page = m_document->page(i);
             if (!page || page->backgroundType != Page::BackgroundType::PDF) {
@@ -5808,17 +5863,12 @@ void DocumentViewport::doAsyncPdfPreload()
             entry.dpi = dpi;
             entry.pixmap = pixmap;
             
-            // Evict page FURTHEST from this page (smart eviction)
+            // Source PDF page numbers need not follow notebook order. Preserve
+            // current demand so completion-driven loading cannot ping-pong
+            // between two reordered pages while retaining unrelated entries.
             if (m_pdfCache.size() >= m_pdfCacheCapacity) {
-                int evictIndex = 0;
-                int maxDistance = -1;
-                for (int i = 0; i < m_pdfCache.size(); ++i) {
-                    int distance = qAbs(m_pdfCache[i].pageIndex - pdfPageNum);
-                    if (distance > maxDistance) {
-                        maxDistance = distance;
-                        evictIndex = i;
-                    }
-                }
+                const int evictIndex = pdfPageCacheEvictionIndex();
+                if (evictIndex < 0) return;
                 m_pdfCache.removeAt(evictIndex);
             }
             
@@ -5998,7 +6048,7 @@ void DocumentViewport::updatePdfCacheCapacity()
             m_pdfCacheCapacity = newCapacity;
             
             // Immediately evict if over new capacity
-            evictFurthestCacheEntries();
+            trimPdfPageCache();
         }
     }
 
@@ -6035,15 +6085,7 @@ void DocumentViewport::updatePdfTileCacheCapacity()
 
         // Trim immediately if the new capacity is lower.
         while (m_pdfTileCache.size() > m_pdfTileCacheCapacity) {
-            int evictIndex = 0;
-            int maxDistance = -1;
-            for (int i = 0; i < m_pdfTileCache.size(); ++i) {
-                const int distance = qAbs(m_pdfTileCache[i].pageIndex - m_currentPageIndex);
-                if (distance > maxDistance) {
-                    maxDistance = distance;
-                    evictIndex = i;
-                }
-            }
+            const int evictIndex = qMax(0, pdfTileCacheEvictionIndex());
             m_pdfTileCache.removeAt(evictIndex);
         }
     }
@@ -6054,29 +6096,15 @@ void DocumentViewport::updatePdfTileCacheCapacity()
     prunePdfTiles();
 }
 
-void DocumentViewport::evictFurthestCacheEntries()
+void DocumentViewport::trimPdfPageCache()
 {
     // Must be called with m_pdfCacheMutex locked
-    
-    // Get reference page for distance calculation
-    int centerPage = m_currentPageIndex;
-    
-    // Evict furthest entries until within capacity
+    // Retain demand by source identity, independent of source page ordering.
     while (m_pdfCache.size() > m_pdfCacheCapacity) {
-        int evictIdx = 0;
-        int maxDistance = -1;
-        
-        for (int i = 0; i < m_pdfCache.size(); ++i) {
-            int dist = qAbs(m_pdfCache[i].pageIndex - centerPage);
-            if (dist > maxDistance) {
-                maxDistance = dist;
-                evictIdx = i;
-            }
-        }
-        
+        const int evictIdx = qMax(0, pdfPageCacheEvictionIndex());
 #ifdef SPEEDYNOTE_DEBUG
         qDebug() << "PDF cache evict: page" << m_pdfCache[evictIdx].pageIndex 
-                 << "distance" << maxDistance << "new size" << (m_pdfCache.size() - 1);
+                 << "new size" << (m_pdfCache.size() - 1);
 #endif
         m_pdfCache.removeAt(evictIdx);
     }
@@ -21639,18 +21667,11 @@ void DocumentViewport::insertPdfTile(const PdfTileEntry& entry)
 
     const int capacity = qMax(1, m_pdfTileCacheCapacity);
 
-    // Smart eviction, mirroring the page cache: drop the tile whose page is
-    // furthest from the one we just rendered.
+    // Keep one tile covering each visible demand. Reordered / multi-source
+    // pages cannot be ranked by subtracting their source PDF page numbers.
     while (m_pdfTileCache.size() >= capacity) {
-        int evictIndex = 0;
-        int maxDistance = -1;
-        for (int i = 0; i < m_pdfTileCache.size(); ++i) {
-            const int distance = qAbs(m_pdfTileCache[i].pageIndex - entry.pageIndex);
-            if (distance > maxDistance) {
-                maxDistance = distance;
-                evictIndex = i;
-            }
-        }
+        const int evictIndex = pdfTileCacheEvictionIndex();
+        if (evictIndex < 0) return;
         m_pdfTileCache.removeAt(evictIndex);
     }
 
@@ -21725,6 +21746,14 @@ void DocumentViewport::doAsyncPdfTilePreload()
         }
         if (covered) {
             continue;
+        }
+
+        {
+            QMutexLocker locker(&m_pdfTileCacheMutex);
+            // If a large viewport exhausts the cache budget, do not render
+            // results that would evict other visible coverage and repeat forever.
+            if (m_pdfTileCache.size() >= qMax(1, m_pdfTileCacheCapacity)
+                && pdfTileCacheEvictionIndex() < 0) continue;
         }
 
         const QString sourceId = page->pdfSourceId;

@@ -180,7 +180,7 @@ node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/paired --cand
 
 该测试使用便携包已有的 Windows 平台插件，不显示测试窗口、不生成性能数据。脚本启动前检查 `platforms/qwindows.dll`，无需额外部署 offscreen 插件。`68ac33a` 对照包没有此测试入口，不需对旧包运行。候选的 `pdf-render-lifecycle.json` 记录每项检查结果；脚本用非零退出码报告失败。它拒绝覆盖已有报告，重试前应自行保留并移走旧报告。修正后的手动测试尚未在实际设备运行。
 
-第二步增加首屏 miss 的异步检查、连续移动后的最新需求、滚动未停止时完成加载，以及多个视口共享提交额度和释放预留的检查。它继续使用原有手动入口。
+第二步增加首屏 miss 的异步检查、连续移动后的最新需求、滚动未停止时完成加载，以及多个视口共享提交额度和释放预留的检查。另覆盖重排页面的缓存保留和区域缓存容量耗尽后不重复渲染。它继续使用原有手动入口。
 
 ```powershell
 node --check benchmarks/pdf/bench.mjs

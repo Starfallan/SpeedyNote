@@ -276,6 +276,73 @@ class PdfRenderLifecycleTests {
                 "obsolete queued content is not inserted into cache");
     }
 
+    static void cacheRetention(const QString& path, Checks& c, bool tiled) {
+        auto document = open(path, c);
+        if (!document) return;
+        // Source order 2, 0, 1 differs from notebook order. With stale page-1
+        // entries, distance-from-new-result eviction alternates 2 and 0 forever.
+        document->page(0)->pdfPageNumber = 2;
+        document->page(1)->pdfPageNumber = 0;
+        document->page(2)->pdfPageNumber = 1;
+        DocumentViewport view;
+        prepare(view, document.get());
+        if (tiled) {
+            view.setZoomLevel(4.0);
+            view.setPanOffset(view.pagePosition(1) - QPointF(0, 45));
+            view.m_scrollSettleTimer->stop();
+            c.check(view.visiblePages().size() == 2, "tile retention test spans two reordered pages");
+        }
+        view.updatePdfCacheCapacity();
+        view.m_pdfPreloadTimer->stop();
+        const QString source = document->page(0)->pdfSourceId;
+        QPixmap marker(1, 1);
+        marker.fill(Qt::white);
+        const int capacity = tiled ? view.m_pdfTileCacheCapacity : view.m_pdfCacheCapacity;
+        for (int i = 0; i < capacity; ++i) {
+            if (tiled) {
+                PdfTileEntry entry;
+                entry.sourceId = QStringLiteral("previous-source-%1").arg(i);
+                entry.pageIndex = 1;
+                entry.dpi = view.pdfTileDpi();
+                entry.regionUnits = QRectF(QPointF(0, 0), document->page(0)->size);
+                entry.pixmap = marker;
+                view.m_pdfTileCache.append(entry);
+            } else {
+                PdfCacheEntry entry;
+                entry.sourceId = QStringLiteral("previous-source-%1").arg(i);
+                entry.pageIndex = 1;
+                entry.dpi = view.effectivePdfDpi();
+                entry.pixmap = marker;
+                view.m_pdfCache.append(entry);
+            }
+        }
+        view.doAsyncPdfPreload();
+        c.check(waitUntil([&] {
+            const bool bothCached = tiled
+                ? !view.lookupCachedPdfTiles(source, 2, view.pdfTileDpi()).isEmpty()
+                    && !view.lookupCachedPdfTiles(source, 0, view.pdfTileDpi()).isEmpty()
+                : !view.lookupCachedPdfPage(source, 2, view.effectivePdfDpi()).isNull()
+                    && !view.lookupCachedPdfPage(source, 0, view.effectivePdfDpi()).isNull();
+            return bothCached && view.m_activePdfWatchers.isEmpty() && !view.m_pdfPreloadTimer->isActive();
+        }), "reordered pages retain current demand and finish without repeated eviction");
+        if (tiled) {
+            view.cancelAndWaitForBackgroundThreads();
+            view.m_pdfTileCache.clear();
+            view.m_pdfTileCacheCapacity = 1;
+            PdfTileEntry entry;
+            entry.sourceId = source;
+            entry.pageIndex = 2;
+            entry.dpi = view.pdfTileDpi();
+            entry.regionUnits = QRectF(QPointF(0, 0), document->page(0)->size);
+            entry.pixmap = marker;
+            view.insertPdfTile(entry);
+            view.doAsyncPdfTilePreload();
+            c.check(view.m_activePdfWatchers.isEmpty() && !view.m_pdfPreloadTimer->isActive()
+                    && view.m_pdfTileCache.size() == 1 && view.m_pdfTileCache.first().pageIndex == 2,
+                    "exhausted tile cache does not replace visible coverage in a render loop");
+        }
+    }
+
     static void sharedAdmission(const QString& path, Checks& c) {
         auto document = open(path, c);
         if (!document) return;
@@ -334,6 +401,8 @@ public:
         repaint(pdfPath, c);
         latestDemand(pdfPath, c, false);
         latestDemand(pdfPath, c, true);
+        cacheRetention(pdfPath, c, false);
+        cacheRetention(pdfPath, c, true);
         sharedAdmission(pdfPath, c);
         QSaveFile report(reportPath);
         if (!report.open(QIODevice::WriteOnly)) return 2;

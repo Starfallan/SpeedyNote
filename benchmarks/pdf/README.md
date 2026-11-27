@@ -176,6 +176,8 @@ node benchmarks/pdf/bench.mjs run --exe ./speedynote-step3.exe --against ./speed
 
 第四步手动功能检查覆盖：按住期间整页和区域完成后进入截图、无新增输入时显示、笔迹与图片层次、主题/隐藏/文档切换、DPR 1/1.25/1.5/2 的往返偏移及透明文本重复绘制。合成发生在 paint 计时内，不能用低 paint 数字隐藏 timer 中的绘制成本；它仍不是物理笔到屏幕延迟测试。
 
+`bf44efb` x86_64 包已在开发机手动执行 371 项功能检查并全部通过；ARM64 运行期、Surface 的等待/CPU/内存/笔输入仍需实测。早期 `822ff29` / `8b62de1` 的手动报告有失败，使用 `bf44efb` 或更新版本执行本节验证。
+
 第二步候选提供滚动中的可见需求调度和任务上限，普通整页 miss 不再同步渲染。其测试标签可用 `--label step2`。原生探针和 runner 未修改，可与已有 baseline / step1 对比；先使用 `--case text-scroll --repeat 1` 检查滚动过程中是否出现内容，再测 `real-scroll` / `real-pan`。单视口的 `sampled_max_pending` 应不超过 1，但这是采样值，完整并发约束由手动功能测试检查。手形截图路径未在第二步修改，不能期待 `vector-hand` 的新区域空白因此消失。
 
 第三步候选复用最多两个 worker provider；每个 provider 仅保留一个热点页 display list，构建期间 MuPDF context 分配限额为 32 MiB。深色图片区域提取和像素转换在 worker 完成，离屏但仍有效的已完成图像可以进入现有缓存供回看使用。并发、光栅和图片缓存预算不增加；32 MiB 不代表整个 provider 或进程内存上限。首次构建有成本，复杂页超额会退回直接渲染，需同时比较首屏、空白、CPU 和峰值内存。手形截图的新区域仍不在此步范围内。

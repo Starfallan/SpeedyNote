@@ -2,7 +2,7 @@
 
 // Integration checks using the real viewport, QtConcurrent and a generated PDF.
 // The worker pool gate makes duplicate/invalidation races deterministic. No
-// QtTest or interactive desktop is required; this is NOT a performance test.
+// QtTest or visible window is required; this is NOT a performance test.
 #include "DocumentViewport.h"
 #include <QApplication>
 #include <QElapsedTimer>

@@ -2,7 +2,7 @@
 
 用于比较 `2f65852` 的 PDF 渲染行为与后续优化，覆盖打开文档、普通连续滚动、高倍页内移动、手形拖动、反向回看、跳页及深色模式。使用真实 `DocumentViewport`、MuPDF、缓存、worker 和 Qt 桌面事件循环；没有替换渲染器或修改调度策略。
 
-**当前状态：工具测试通过；用户已运行 Actions 构建的 `68ac33a` 基线程序，但首次 smoke 为 `initial_timeout`，尚无有效 baseline。** Windows runner 的隐藏窗口参数已修正，需用原基线程序重新测量。第一步优化 `a797b8a` 的原生编译和功能测试尚待 Actions 验证。新增开关默认关闭，普通构建不包含测量代码。
+**当前状态：工具测试通过；用户已运行 Actions 构建的 `68ac33a` 基线程序，但首次 smoke 为 `initial_timeout`，尚无有效 baseline。** Windows runner 的隐藏窗口参数已修正，需用原基线程序重新测量。第一步优化经 `c260c0d` 修正测试编译错误后，x86_64 / ARM64 原生编译已通过；功能测试因原脚本要求未部署的 offscreen 插件而超时，改用包内 Windows 插件后待本机验证。新增开关默认关闭，普通构建不包含测量代码。
 
 ## 通过现有 GitHub Actions 构建
 
@@ -170,13 +170,13 @@ node benchmarks/pdf/bench.mjs compare --baseline out/pdf-benchmark/paired --cand
 
 ## 验证工具
 
-后续候选构建另外包含 PDF 请求生命周期功能测试，覆盖去重、失效、文档切换和局部重绘。Windows Benchmark workflow 会在编译后自动执行；也可在本机调用：
+后续候选构建另外包含 PDF 请求生命周期功能测试，覆盖去重、失效、文档切换和局部重绘。该测试由用户下载构建包后按需运行，Actions 不执行它，也不以它的结果限制构建包上传。从便携包根目录调用：
 
 ```powershell
-./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory out/pdf-benchmark/build-candidate
+./benchmarks/pdf/check-render-lifecycle.ps1 -BuildDirectory .
 ```
 
-该测试使用 offscreen 平台，不生成性能数据。`68ac33a` 对照包没有此测试入口，不需对旧包运行。候选的 `pdf-render-lifecycle.json` 记录每项检查结果，失败会阻止 workflow 上传候选包。本地环境尚未编译运行该测试。
+该测试使用便携包已有的 Windows 平台插件，不显示测试窗口、不生成性能数据。脚本启动前检查 `platforms/qwindows.dll`，无需额外部署 offscreen 插件。`68ac33a` 对照包没有此测试入口，不需对旧包运行。候选的 `pdf-render-lifecycle.json` 记录每项检查结果；脚本用非零退出码报告失败。它拒绝覆盖已有报告，重试前应自行保留并移走旧报告。修正后的手动测试尚未在实际设备运行。
 
 ```powershell
 node --check benchmarks/pdf/bench.mjs

@@ -6,7 +6,7 @@ Status: proposed
 
 用户要求在实施前按 README 的 Why SpeedyNote 重新审视方案。[README](../../../../README.md) 的第 25–43 行将低端硬件上的高频笔输入、大 PDF 快速打开和小内存占用并列为产品目标。优化必须同时评估输入响应、内容到达时间、总计算量和内存，不能仅凭空白减少或 FPS 上升判断成功。360Hz 在 README 中指笔轮询/输入，不是 PDF 需要每秒完整绘制 360 帧；该描述也不构成本次环境的实测结果。
 
-审查基线仍为 `2f65852`，带测量工具的对照构建为 `68ac33a`。本篇替代[初版提案](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)的实施顺序，保留其代码审查事实和正确性约束。请求去重、失效范围与完成重绘已有[首步实现](../../implemented/bug-fix/2026-11-27-pdf-render-request-lifecycle.md)，尚待原生编译及功能测试；整体阶段未完成。测量代码另见 [PDF Benchmark 决策](../../implemented/testing/2026-11-27-pdf-benchmark.md)，baseline 由用户自行采集，目前没有性能实测结论。
+审查基线仍为 `2f65852`，带测量工具的对照构建为 `68ac33a`。本篇替代[初版提案](../../rejected/architecture/2026-11-27-pdf-scroll-rendering.md)的实施顺序，保留其代码审查事实和正确性约束。请求去重、失效范围与完成重绘已有[首步实现](../../implemented/bug-fix/2026-11-27-pdf-render-request-lifecycle.md)，x86_64 / ARM64 原生编译已通过，功能测试待用户下载后手动执行；整体阶段未完成。测量代码另见 [PDF Benchmark 决策](../../implemented/testing/2026-11-27-pdf-benchmark.md)，baseline 由用户自行采集，目前没有性能实测结论。
 
 初版的问题是将独立预览生成提前，减少无效工作和内存控制放在后续阶段。新增预览会多一次页面执行、可能多次图片解码、分配与拷贝；低 DPI 不能保证解析和解码也按像素比例变便宜。持续预取和增加 worker 会与笔输入、缩略图、搜索竞争 CPU 及内存。需要用实际成本决定是否值得增加这些工作。
 

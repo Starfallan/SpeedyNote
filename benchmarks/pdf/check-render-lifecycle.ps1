@@ -5,11 +5,14 @@ $lifecycleReport = Join-Path $lifecycleBuild 'pdf-render-lifecycle.json'
 if (Test-Path -LiteralPath $lifecycleReport) {
     throw "Report already exists: $lifecycleReport"
 }
-# A functional test using the offscreen Qt platform. It never supplies benchmark
-# timings and does not require an interactive runner desktop.
+# Use the Windows plugin already deployed with the portable package. The test
+# never shows its viewports and does not produce performance measurements.
+if (-not (Test-Path -LiteralPath (Join-Path $lifecycleBuild 'platforms/qwindows.dll') -PathType Leaf)) {
+    throw 'Missing platforms/qwindows.dll; use the complete Windows portable package.'
+}
 $lifecycleProcess = Start-Process -FilePath (Join-Path $lifecycleBuild 'speedynote.exe') `
     -WorkingDirectory $lifecycleBuild `
-    -ArgumentList @('--test-pdf-render-lifecycle', 'pdf-render-lifecycle.json', '-platform', 'offscreen') `
+    -ArgumentList @('--test-pdf-render-lifecycle', 'pdf-render-lifecycle.json', '-platform', 'windows') `
     -WindowStyle Hidden -PassThru
 if (-not $lifecycleProcess.WaitForExit(60000)) {
     $lifecycleProcess.Kill()

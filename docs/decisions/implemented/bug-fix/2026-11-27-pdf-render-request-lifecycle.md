@@ -41,13 +41,13 @@ Status: implemented
 
 ## Testing
 
-新增 `PdfRenderLifecycleTests`，使用 QPdfWriter 创建临时 PDF、真实 MuPDF 和真实视口。通过阻塞单个全局 worker，让请求稳定停留在队列中，然后检查重复提交、同步路径、跨 generation、旧结果回调及恢复行为。测试不用固定 sleep 推断任务已完成；事件等待有 10 秒上限，CI 进程有 60 秒上限。
+新增 `PdfRenderLifecycleTests`，使用 QPdfWriter 创建临时 PDF、真实 MuPDF 和真实视口。通过阻塞单个全局 worker，让请求稳定停留在队列中，然后检查重复提交、同步路径、跨 generation、旧结果回调及恢复行为。测试不用固定 sleep 推断任务已完成；事件等待有 10 秒上限，手动测试脚本的进程有 60 秒上限。
 
 检查包括：同批重复页与多次预加载只提交一次；worker 完成但回调未执行时仍不重复；普通 prune 保留整页结果；失效期间同键请求等待，旧结果不入缓存，随后自动恢复；主题变化生成新主题结果；文档销毁后的旧任务不能污染新文档；joined cancellation 释放身份；多处同源页、区域更新与截图抑制的重绘范围。
 
-Debug 或 Benchmark 桌面构建提供 `--test-pdf-render-lifecycle REPORT.json`。Windows Benchmark workflow 在构建后用 offscreen 平台执行并检查 JSON 和退出码；这是功能验证，不产生性能数字。普通发布构建不包含该测试入口。
+Debug 或 Benchmark 桌面构建提供 `--test-pdf-render-lifecycle REPORT.json`。测试由用户下载包后按需运行，使用已部署的 Windows 平台插件且不显示视口；这是功能验证，不产生性能数字。普通发布构建不包含该测试入口。原先在 Actions 自动执行并阻止上传的安排由[手动验证决定](../process/2026-11-27-pdf-benchmark-manual-validation.md)取代。
 
-本地缺少 Qt/MuPDF，新增原生代码和这些测试**尚未编译运行**。已核对 Qt 官方 QFutureWatcher 的异步取消、完成通知行为：不能把 cancel 当成 worker 已停止。脚本与文档静态验证另行记录于交付结果；必须在后续 Actions 中执行原生功能测试，并以用户采集的 baseline 验证 CPU、页调用数、paint 长尾和空白面积时间。
+本地缺少 Qt/MuPDF。`c260c0d` 修正测试中嵌套类型的作用域后，Actions 的 x86_64 / ARM64 编译均通过；原脚本使用未部署的 offscreen 插件，运行阶段超时，**功能检查尚未通过**。手动脚本改用已有的 Windows 插件，仍待用户实机运行。已核对 Qt 官方 QFutureWatcher 的异步取消、完成通知行为：不能把 cancel 当成 worker 已停止。性能收益仍须以用户采集的 baseline 验证 CPU、页调用数、paint 长尾和空白面积时间。
 
 ## Consequences
 

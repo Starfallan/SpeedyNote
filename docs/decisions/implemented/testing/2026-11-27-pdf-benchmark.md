@@ -6,7 +6,7 @@ Status: implemented
 
 `2f65852` 修复高倍清晰度后，用户报告普通翻页与高倍移动均有空白等待。现有 F10 `ViewportPerfMonitor` 是短时滚动统计，不记录内容覆盖，且 FPS 计算排除超过 250 ms 的间隔；现有 PDF tile 测试主要验证几何。它们不能说明用户等待改善多少，也不能排除以更高 CPU、内存和输入停顿换取画面的情况。
 
-用户要求按 README 的 Performance First 建立 baseline，并选择固定生成样本加真实 PDF。当前机器没有 Qt/MuPDF 开发环境，用户允许沿用 GitHub Actions 构建。本记录说明测量基础设施，**不表示已有实测 baseline，也不表示原生入口已编译成功**。
+用户要求按 README 的 Performance First 建立 baseline，并选择固定生成样本加真实 PDF。当前机器没有 Qt/MuPDF 开发环境，用户沿用 GitHub Actions 构建，已在实际 Windows 设备运行 `68ac33a`。首次 smoke 导入 24 页文本 PDF 约 24 ms，但 15 秒内 frames 为空、整页和区域渲染调用均为 0，返回 `initial_timeout`；**尚无有效 baseline**。
 
 ## Decision
 
@@ -22,6 +22,12 @@ Node 工具只依赖内置模块，生成文本、合成扫描、复杂矢量、
 
 使用方法及指标边界见 [Benchmark README](../../../../benchmarks/pdf/README.md)。
 
+### Windows 启动窗口
+
+runner 显式使用 `windowsHide: false`。Node 的 `spawnSync` 将 `windowsHide: true` 映射为 `UV_PROCESS_WINDOWS_HIDE`；libuv 设置 `STARTF_USESHOWWINDOW` 和 `SW_HIDE`，同时影响 GUI。证据为 [Node spawn_sync.cc](https://github.com/nodejs/node/blob/v24.x/src/spawn_sync.cc) 和 [内置 libuv process.c](https://github.com/nodejs/node/blob/v24.x/deps/uv/src/win/process.c)。[Qt Windows 窗口实现](https://github.com/qt/qtbase/blob/6.12/src/plugins/platforms/windows/qwindowswindow.cpp) 通过 `ShowWindow` 显示窗口，普通激活流程不保证再次显示被隐藏的窗口。
+
+这解释了首次 smoke 没有 paint 的可能机制，但尚未经同一设备重试确认。修正只修改 Node 启动参数，不改变原生探针、超时或质量标准；用户保留原 baseline exe 和 DLL，仅更新脚本后重试。新 baseline 和 candidate 必须统一使用修正版 runner。原生入口的 `isVisible()`/`isMinimized()` 检查不能证明操作系统窗口已 exposed，因此 `initial_timeout` 必须结合帧数、渲染计数和实际窗口观察解读。
+
 ## Alternatives considered
 
 | 选项 | 最强理由 | 取舍 |
@@ -31,13 +37,14 @@ Node 工具只依赖内置模块，生成文本、合成扫描、复杂矢量、
 | 在 GitHub hosted runner 生成 UI baseline | CI 自动化方便，无需本机环境 | 显示环境与共享资源不稳定，不能代表低端设备；CI 负责构建，再下载测量 |
 | 只测真实 PDF | 更接近用户问题 | 文档可能私有、变化或无法共享；固定语料用于重复对比，真实 PDF 用于代表性验证 |
 | 用截图白色比例识别未加载 | 不需渲染探针 | PDF 本身白纸和背景不能区分，截图还有复制成本；使用实际绘制覆盖，并明确其不是物理屏幕呈现或像素正确性验证 |
+| 延长首屏超时 | 对真正缓慢的文档可获得完整结果 | 首次失败没有任何 paint 或光栅调用；延时不能纠正启动时隐藏 GUI，保留原超时并修正启动参数 |
 
 ## Testing
 
 - `node --check benchmarks/pdf/bench.mjs` 通过。
 - `node --test benchmarks/pdf/bench.test.mjs`：8 项通过。验证 PDF xref/stream 结构、固定生成、积分的长间隔与边界、回看分段、统计、不可比条件、文件不覆盖和失败进程记录。
 - `package.ps1` 和 Windows workflow 中的 8 个 PowerShell 脚本块经 parser 静态语法检查通过。工作流 YAML 未经 actionlint 验证，需要真正执行后才能证明构建及部署有效。
-- 尚未编译/运行新增 C++ 入口，尚未用 MuPDF 打开生成语料，尚未人工核对轨迹与覆盖率，尚未采集任何应用性能数字。本地测试通过不能替代这些验证。
+- 用户的 Actions 基线程序已运行并报告 MuPDF 导入 24 页生成文本样本；首次 smoke 失败，无绘制和滚动数据。修正 runner 后的实际窗口、轨迹与覆盖率仍待同设备重试，完整语料和第一步优化的原生功能测试尚未验证。本地 Node 测试不能替代这些验证。
 
 ## Consequences
 

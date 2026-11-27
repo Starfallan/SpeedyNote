@@ -223,7 +223,9 @@ function run(options) {
       if (test.dark) args.push('--benchmark-dark');
       if (options['no-coverage']) args.push('--benchmark-no-coverage');
       console.log(`${stem} ...`);
-      const child = spawnSync(binary.path, args, { cwd: path.dirname(binary.path), timeout: 60000, windowsHide: true, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+      // libuv maps windowsHide to SW_HIDE for GUI windows too. This benchmark
+      // needs an exposed desktop window to receive paint events.
+      const child = spawnSync(binary.path, args, { cwd: path.dirname(binary.path), timeout: 60000, windowsHide: false, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
       let result;
       try {
         result = fs.existsSync(nativeFile) ? enrich(readJson(nativeFile)) : { schema: 1, protocol: PROTOCOL, status: 'no_result', metrics: {} };

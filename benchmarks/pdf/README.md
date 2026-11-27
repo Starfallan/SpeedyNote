@@ -2,7 +2,7 @@
 
 用于比较 `2f65852` 的 PDF 渲染行为与后续优化，覆盖打开文档、普通连续滚动、高倍页内移动、手形拖动、反向回看、跳页及深色模式。使用真实 `DocumentViewport`、MuPDF、缓存、worker 和 Qt 桌面事件循环；没有替换渲染器或修改调度策略。
 
-**当前状态：工具测试通过；原生入口尚未在本地编译或运行，尚无实测 baseline。** GitHub Actions 的构建也需要提交这些改动后实际执行。新增开关默认关闭，普通构建不包含测量代码。
+**当前状态：工具测试通过；用户已运行 Actions 构建的 `68ac33a` 基线程序，但首次 smoke 为 `initial_timeout`，尚无有效 baseline。** Windows runner 的隐藏窗口参数已修正，需用原基线程序重新测量。第一步优化 `a797b8a` 的原生编译和功能测试尚待 Actions 验证。新增开关默认关闭，普通构建不包含测量代码。
 
 ## 通过现有 GitHub Actions 构建
 
@@ -90,7 +90,7 @@ node benchmarks/pdf/bench.mjs generate --out out/pdf-benchmark/corpus-real --pdf
 
 ## 采集 baseline
 
-基线为 **`2f65852` + 相同测量代码**。本次没有实现 PDF 性能优化。保留构建所对应的源版本及 diff；不能用没有测量入口的旧 exe 与新入口直接比较。
+基线程序为 **`68ac33a`（`2f65852` 的 PDF 渲染行为 + 测量代码）**。`a797b8a` 已包含第一步优化，其构建应作为 candidate，不能替换 baseline。保留基线 exe、依赖和构建记录；基线与候选均使用同一份最新 runner 脚本，不能用没有测量入口的旧 exe 与新入口直接比较。
 
 Actions 下载包中的 exe 在根目录。首次只测一个 case，人工确认 PDF 能打开、固定缩放正确、向下及回看轨迹有效，再采集完整 suite：
 
@@ -111,6 +111,18 @@ node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchma
 - jump：从首页跳到第 11 页（不足则最后一页），等待目标内容绘制。
 
 首屏达到目标清晰度且 PDF 任务空闲后再等待 0.5 秒，开始轨迹。结束后等待清晰绘制及 PDF 任务、相关 timer 完成。初始等待和最终等待有超时，进程还受 60 秒外部超时限制。驱动使用实际时间推进；停顿后的过期输入直接跳过，避免用补发输入掩盖卡顿。
+
+### Windows 首屏超时排查
+
+`initial_timeout` 是失败结果，不能作为性能 baseline。若原始 JSON 中 `frames` 为空、整页/区域 render calls 都为 0、`motion_start_ms` 为 null，说明测量期间没有记录绘制，滚动尚未开始；15 秒表示首屏等待超时，不能解释为 PDF 光栅渲染花了 15 秒。
+
+早期 runner 使用 `windowsHide: true`，Node/libuv 在 Windows 上会为 GUI 窗口设置 `SW_HIDE`，可能导致 Qt 窗口没有 paint。这一启动参数现为 `false`。已有 `68ac33a` 便携包只需用仓库最新 `benchmarks/pdf/bench.mjs` 替换包内同名文件，保留 exe 和 DLL，无需重新编译。然后从便携包根目录使用新的输出目录重试：
+
+```powershell
+node benchmarks/pdf/bench.mjs run --exe ./speedynote.exe --suite out/pdf-benchmark/corpus-real/suite.json --out out/pdf-benchmark/smoke-visible --case text-scroll --repeat 1
+```
+
+应看到 PDF 窗口自动向下滚动并返回，结束显示 `0 unsuccessful`，结果 `status` 为 `ok` 且有帧与运动时间。若仍超时，保留新结果并检查窗口是否实际显示及有无内容。`text-scroll` 使用生成的文本样本；`corpus-real` 中的真实 PDF 对应 `real-scroll` / `real-pan`。修正 runner 不改变原生探针；后续 baseline/candidate 必须用同一修正版脚本重新采集，以满足 runner 哈希一致的比较条件。
 
 ## 指标如何解释
 

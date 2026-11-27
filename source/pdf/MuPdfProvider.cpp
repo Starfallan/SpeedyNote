@@ -3,6 +3,9 @@
 // ============================================================================
 
 #include "MuPdfProvider.h"
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+#include "../benchmarks/PdfBenchmarkSupport.h"
+#endif
 
 #include "MuPdfLocks.h"
 
@@ -316,6 +319,9 @@ void pixmapToQImageInto(fz_context* ctx, fz_pixmap* pix, QImage& out)
 
 QImage MuPdfProvider::renderPageToImage(int pageIndex, qreal dpi) const
 {
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    PdfBenchmark::RasterSample benchmarkSample(false);
+#endif
     // Thread safety: MuPDF context is not thread-safe, so we need to serialize access
     // This is especially important on Android where main thread sync renders can
     // overlap with background async renders (BUG-A006)
@@ -398,12 +404,18 @@ QImage MuPdfProvider::renderPageToImage(int pageIndex, qreal dpi) const
         return QImage();
     }
     
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    benchmarkSample.result(result);
+#endif
     return result;
 }
 
 QImage MuPdfProvider::renderPageRegionToImage(int pageIndex, qreal dpi,
                                               const QRectF& clipRegionPt) const
 {
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    PdfBenchmark::RasterSample benchmarkSample(true);
+#endif
     // Same serialisation rules as the whole-page render: one MuPDF context is
     // not thread-safe, and tiles are rendered on worker threads while the main
     // thread may render synchronously.
@@ -491,6 +503,9 @@ QImage MuPdfProvider::renderPageRegionToImage(int pageIndex, qreal dpi,
         return QImage();
     }
 
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    benchmarkSample.result(result);
+#endif
     return result;
 }
 

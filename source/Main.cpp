@@ -18,6 +18,9 @@
 #include "ui/launcher/Launcher.h"
 #include "platform/SystemNotification.h"
 #include "core/DocumentViewport.h"
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+#include "benchmarks/PdfBenchmark.h"
+#endif
 // CLI support (Desktop only). Excluded on HarmonyOS as well: Qt builds the app
 // as a shared module loaded by an ArkTS host there, so there is no argv-taking
 // executable for a command line to attach to.
@@ -1227,6 +1230,12 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     app.setOrganizationName("SpeedyNote");
     app.setApplicationName("App");
+
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    // Before session restore, settings initialization and single-instance IPC.
+    if (app.arguments().contains(QStringLiteral("--benchmark-pdf")))
+        return PdfBenchmark::run(app);
+#endif
 
 #ifdef Q_OS_WIN
     applyWindowsPalette(app);

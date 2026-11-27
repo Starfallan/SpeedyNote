@@ -531,6 +531,11 @@ void DocumentViewport::setDocument(Document* doc)
         } else {
             // New paged document: zoom to fit page width
             // Deferred to ensure widget has correct dimensions
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+            // The benchmark sets an explicit initial zoom. A deferred auto-fit
+            // would overwrite it and make the recorded trajectory incorrect.
+            if (!m_pdfBenchmarkSink)
+#endif
             QTimer::singleShot(0, this, [this]() {
                 if (m_document && !m_document->isEdgeless()) {
                     zoomToWidth();
@@ -20654,6 +20659,10 @@ void DocumentViewport::renderPage(QPainter& painter, Page* page, int pageIndex)
                         if (!pdfPixmap.isNull()) {
                             // Scale pixmap to fit page rect
                             painter.drawPixmap(pageRect.toRect(), pdfPixmap);
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+                            if (m_pdfBenchmarkSink)
+                                m_pdfBenchmarkSink->pdfDraw(painter.worldTransform().mapRect(pageRect), dpi);
+#endif
                         }
                     }
                 }
@@ -21499,6 +21508,10 @@ void DocumentViewport::drawCachedPdfTiles(QPainter& painter, const Page* page, i
         // The tile was rendered at the DPI the screen needs, so this is a 1:1
         // blit even though it goes through the zoomed painter transform.
         painter.drawPixmap(tile.regionUnits, tile.pixmap, QRectF(tile.pixmap.rect()));
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+        if (m_pdfBenchmarkSink)
+            m_pdfBenchmarkSink->pdfDraw(painter.worldTransform().mapRect(tile.regionUnits), tile.dpi);
+#endif
     }
 
     // Self-heal: this path never renders, so the only thing that fills the cache

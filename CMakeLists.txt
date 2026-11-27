@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Build Options
 # ============================================================================
 option(ENABLE_DEBUG_OUTPUT "Enable verbose debug output (qDebug prints)" OFF)
+option(SPEEDYNOTE_ENABLE_PDF_BENCHMARK "Build the opt-in desktop PDF benchmark entry point" OFF)
 option(ENABLE_SANITIZERS "Enable AddressSanitizer + LeakSanitizer for memory debugging" OFF)
 option(SPEEDYNOTE_ENABLE_WINDOWS_INK_OCR "Enable Windows Ink handwriting recognition (requires Windows 10 1703+)" OFF)
 option(SPEEDYNOTE_ENABLE_MLKIT_INK_OCR "Enable ML Kit Digital Ink OCR (Android/iOS)" OFF)
@@ -1169,9 +1170,36 @@ endif()
 # ============================================================================
 # Main Application Sources
 # ============================================================================
+set(PDF_BENCHMARK_SOURCES "")
+if(SPEEDYNOTE_ENABLE_PDF_BENCHMARK)
+    if(ANDROID OR IOS OR OHOS)
+        message(FATAL_ERROR "The PDF benchmark v1 requires a desktop window/event loop")
+    endif()
+    if(ENABLE_DEBUG_OUTPUT OR ENABLE_SANITIZERS)
+        message(FATAL_ERROR "Use Release without debug logging/sanitizers for PDF benchmarks")
+    endif()
+    if(NOT MUPDF_FOUND)
+        message(FATAL_ERROR "The PDF benchmark requires MuPDF")
+    endif()
+    add_compile_definitions(SPEEDYNOTE_PDF_BENCHMARK)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        source/benchmarks/PdfBenchmark.cpp source/benchmarks/PdfBenchmarkSupport.h)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/source/benchmarks/PdfBenchmark.cpp" _pdf_bench_cpp_hash)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/source/benchmarks/PdfBenchmarkSupport.h" _pdf_bench_support_hash)
+    string(SHA256 _pdf_bench_hash "${_pdf_bench_cpp_hash}${_pdf_bench_support_hash}")
+    add_compile_definitions(SPEEDYNOTE_PDF_BENCHMARK_HASH="${_pdf_bench_hash}")
+    get_directory_property(_pdf_bench_options COMPILE_OPTIONS)
+    string(SHA256 _pdf_bench_build_hash
+        "${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_CXX_FLAGS};${CMAKE_CXX_FLAGS_RELEASE};${CMAKE_EXE_LINKER_FLAGS};${CMAKE_EXE_LINKER_FLAGS_RELEASE};${_pdf_bench_options}")
+    add_compile_definitions(SPEEDYNOTE_PDF_BENCHMARK_BUILD_HASH="${_pdf_bench_build_hash}"
+        SPEEDYNOTE_PDF_BENCHMARK_CONFIG="$<CONFIG>")
+    list(APPEND PDF_BENCHMARK_SOURCES source/benchmarks/PdfBenchmark.cpp)
+endif()
+
 set(APP_SOURCES
         source/Main.cpp
         source/MainWindow.cpp
+        ${PDF_BENCHMARK_SOURCES}
     source/ControlPanelDialog.cpp
     source/ui/dialogs/KeyCaptureDialog.cpp
     source/ui/dialogs/PageRangeSelectDialog.cpp

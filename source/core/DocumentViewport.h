@@ -36,6 +36,9 @@ enum class TouchGestureMode {
 #include "../pdf/PdfSearchEngine.h"
 #include <functional>
 #include "../pdf/PdfTileGeometry.h"  // region math for high-DPI PDF tiles
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+#include "../benchmarks/PdfBenchmarkSupport.h"
+#endif
 #include <QStack>
 #include <QMap>
 #include <QSet>
@@ -404,6 +407,10 @@ class DocumentViewport : public QWidget {
     
     // Allow test class to access private members
     friend class DocumentViewportTests;
+#ifdef SPEEDYNOTE_PDF_BENCHMARK
+    friend class PdfBenchmarkViewport;
+    PdfBenchmark::PaintSink* m_pdfBenchmarkSink = nullptr;
+#endif
     
 public:
     // ===== Handle Hit Types (for lasso selection) =====

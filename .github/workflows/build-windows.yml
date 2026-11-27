@@ -4,13 +4,33 @@ on:
   push:
     tags:
       - 'v*'  # Trigger on version tags (e.g., v1.2.1, v2.0.0-beta)
-  workflow_dispatch:  # Allow manual trigger  
+  workflow_dispatch:
+    inputs:
+      pdf_benchmark:
+        description: Build portable PDF benchmark packages (measure on your own desktop)
+        type: boolean
+        default: false
+
+env:
+  PDF_BENCHMARK: ${{ github.event_name == 'workflow_dispatch' && inputs.pdf_benchmark && 'ON' || 'OFF' }}
 
 # Required for release uploads
 permissions:
   contents: write
 
 jobs:
+  benchmark-tools:
+    if: ${{ inputs.pdf_benchmark }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --test benchmarks/pdf/bench.test.mjs
+
   build-windows:
     name: Build Windows x86_64
     runs-on: windows-latest
@@ -40,6 +60,7 @@ jobs:
             mingw-w64-clang-x86_64-ntldd
 
       - name: Install Inno Setup
+        if: ${{ !inputs.pdf_benchmark }}
         run: |
           choco install innosetup -y
         shell: pwsh
@@ -107,6 +128,7 @@ jobs:
             "-DCMAKE_MAKE_PROGRAM=mingw32-make",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DENABLE_DEBUG_OUTPUT=OFF",
+            "-DSPEEDYNOTE_ENABLE_PDF_BENCHMARK=$env:PDF_BENCHMARK",
             "-DQT_PATH=$toolchainPath"
           )
           
@@ -209,6 +231,10 @@ jobs:
           Write-Host "Copied $copiedCount DLL(s)" -ForegroundColor Green
           Write-Host "::endgroup::"
           
+          if ($env:PDF_BENCHMARK -eq 'ON') {
+            & ../benchmarks/pdf/package.ps1 -BuildDirectory . -MsysRoot "$env:RUNNER_TEMP\msys64"
+          }
+
           Write-Host "::group::Clean up build artifacts" -ForegroundColor Cyan
           # Remove build artifacts not needed for packaging
           $cleanupItems = @(
@@ -246,6 +272,7 @@ jobs:
         shell: pwsh
 
       - name: Create Inno Setup Installer
+        if: ${{ !inputs.pdf_benchmark }}
         run: |
           Write-Host "Creating Windows installer with Inno Setup..." -ForegroundColor Cyan
           
@@ -278,13 +305,22 @@ jobs:
         shell: pwsh
 
       - name: Upload Installer
+        if: ${{ !inputs.pdf_benchmark }}
         uses: actions/upload-artifact@v4
         with:
           name: speedynote-windows-installer-x86_64
           path: "Output/*.exe"
 
+      - name: Upload PDF benchmark package
+        if: ${{ inputs.pdf_benchmark }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: speedynote-pdf-benchmark-x86_64
+          path: build/
+          if-no-files-found: error
+
       - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && !inputs.pdf_benchmark
         uses: softprops/action-gh-release@v1
         with:
           files: "Output/*.exe"
@@ -320,6 +356,7 @@ jobs:
             mingw-w64-clang-aarch64-ntldd
 
       - name: Install Inno Setup
+        if: ${{ !inputs.pdf_benchmark }}
         run: |
           # Inno Setup is x86 and runs fine under Windows-on-ARM x64 emulation.
           choco install innosetup -y
@@ -404,6 +441,7 @@ jobs:
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_SYSTEM_PROCESSOR=arm64",
             "-DENABLE_DEBUG_OUTPUT=OFF",
+            "-DSPEEDYNOTE_ENABLE_PDF_BENCHMARK=$env:PDF_BENCHMARK",
             "-DQT_PATH=$toolchainPathFwd"
           )
 
@@ -502,6 +540,10 @@ jobs:
           Write-Host "Copied $copiedCount DLL(s)" -ForegroundColor Green
           Write-Host "::endgroup::"
 
+          if ($env:PDF_BENCHMARK -eq 'ON') {
+            & ../benchmarks/pdf/package.ps1 -BuildDirectory . -MsysRoot "$env:RUNNER_TEMP\msys64"
+          }
+
           Write-Host "::group::Clean up build artifacts" -ForegroundColor Cyan
           $cleanupItems = @(
             ".qt", "speedynote_autogen", "CMakeFiles", "CMakeCache.txt",
@@ -531,6 +573,7 @@ jobs:
         shell: pwsh
 
       - name: Create Inno Setup Installer
+        if: ${{ !inputs.pdf_benchmark }}
         run: |
           Write-Host "Creating Windows installer with Inno Setup..." -ForegroundColor Cyan
 
@@ -560,13 +603,22 @@ jobs:
         shell: pwsh
 
       - name: Upload Installer
+        if: ${{ !inputs.pdf_benchmark }}
         uses: actions/upload-artifact@v4
         with:
           name: speedynote-windows-installer-arm64
           path: "Output/*.exe"
 
+      - name: Upload PDF benchmark package
+        if: ${{ inputs.pdf_benchmark }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: speedynote-pdf-benchmark-arm64
+          path: build/
+          if-no-files-found: error
+
       - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && !inputs.pdf_benchmark
         uses: softprops/action-gh-release@v1
         with:
           files: "Output/*.exe"
